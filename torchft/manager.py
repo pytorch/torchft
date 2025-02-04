@@ -38,9 +38,9 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
 import torch
 from torch.distributed import ReduceOp, TCPStore
 
+from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointServer, CheckpointTransport
 from torchft.futures import future_timeout
-from torchft.torchft import Manager as _Manager, ManagerClient
 
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
@@ -179,7 +179,7 @@ class Manager:
             wait_for_workers=False,
         )
         self._pg = pg
-        self._manager: Optional[_Manager] = None
+        self._manager: Optional[ManagerServer] = None
 
         if rank == 0:
             if port is None:
@@ -191,7 +191,7 @@ class Manager:
             if replica_id is None:
                 replica_id = ""
             replica_id = replica_id + str(uuid.uuid4())
-            self._manager = _Manager(
+            self._manager = ManagerServer(
                 replica_id=replica_id,
                 lighthouse_addr=lighthouse_addr,
                 hostname=hostname,
@@ -428,7 +428,7 @@ class Manager:
     def _async_quorum(
         self, allow_heal: bool, shrink_only: bool, quorum_timeout: timedelta
     ) -> None:
-        quorum = self._client.quorum(
+        quorum = self._client._quorum(
             rank=self._rank,
             step=self._step,
             checkpoint_metadata=self._checkpoint_transport.metadata(),
@@ -497,7 +497,7 @@ class Manager:
                 primary_client = ManagerClient(
                     recover_src_manager_address, connect_timeout=self._connect_timeout
                 )
-                checkpoint_metadata = primary_client.checkpoint_metadata(
+                checkpoint_metadata = primary_client._checkpoint_metadata(
                     self._rank, timeout=self._timeout
                 )
                 recover_src_rank = quorum.recover_src_rank

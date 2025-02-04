@@ -3,7 +3,7 @@ from typing import List, Optional
 
 class ManagerClient:
     def __init__(self, addr: str, connect_timeout: timedelta) -> None: ...
-    def quorum(
+    def _quorum(
         self,
         rank: int,
         step: int,
@@ -11,7 +11,7 @@ class ManagerClient:
         shrink_only: bool,
         timeout: timedelta,
     ) -> QuorumResult: ...
-    def checkpoint_metadata(self, rank: int, timeout: timedelta) -> str: ...
+    def _checkpoint_metadata(self, rank: int, timeout: timedelta) -> str: ...
     def should_commit(
         self,
         rank: int,
@@ -33,7 +33,7 @@ class QuorumResult:
     max_world_size: int
     heal: bool
 
-class Manager:
+class ManagerServer:
     def __init__(
         self,
         replica_id: str,
@@ -48,7 +48,7 @@ class Manager:
     def address(self) -> str: ...
     def shutdown(self) -> None: ...
 
-class Lighthouse:
+class LighthouseServer:
     def __init__(
         self,
         bind: str,

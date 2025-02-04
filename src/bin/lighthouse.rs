@@ -4,8 +4,8 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
+use _torchft::lighthouse::{Lighthouse, LighthouseOpt};
 use structopt::StructOpt;
-use torchft::lighthouse::{Lighthouse, LighthouseOpt};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {

@@ -30,15 +30,30 @@ use crate::torchftpb::manager_service_client::ManagerServiceClient;
 use crate::torchftpb::{CheckpointMetadataRequest, ManagerQuorumRequest, ShouldCommitRequest};
 use pyo3::prelude::*;
 
+/// ManagerServer is a GRPC server for the manager service.
+/// There should be one manager server per replica group (typically running on
+/// the rank 0 host). The individual ranks within a replica group should use
+/// ManagerClient to communicate with the manager server and participate in
+/// quorum operations.
+///
+/// Args:
+///     replica_id (str): The ID of the replica group.
+///     lighthouse_addr (str): The HTTP address of the lighthouse server.
+///     hostname (str): The hostname of the manager server.
+///     bind (str): The HTTP address to bind the server to.
+///     store_addr (str): The HTTP address of the store server.
+///     world_size (int): The world size of the replica group.
+///     heartbeat_interval (timedelta): The interval at which heartbeats are sent.
+///     connect_timeout (timedelta): The timeout for connecting to the lighthouse server.
 #[pyclass]
-struct Manager {
+struct ManagerServer {
     handle: JoinHandle<Result<()>>,
     manager: Arc<manager::Manager>,
     _runtime: Runtime,
 }
 
 #[pymethods]
-impl Manager {
+impl ManagerServer {
     #[new]
     fn new(
         py: Python<'_>,
@@ -74,10 +89,15 @@ impl Manager {
         })
     }
 
+    /// address returns the address of the manager server.
+    ///
+    /// Returns:
+    ///   str: The address of the manager server.
     fn address(&self) -> PyResult<String> {
         Ok(self.manager.address().to_string())
     }
 
+    /// shutdown shuts down the manager server.
     fn shutdown(&self, py: Python<'_>) {
         py.allow_threads(move || {
             self.handle.abort();
@@ -85,6 +105,13 @@ impl Manager {
     }
 }
 
+/// ManagerClient is a GRPC client to the manager service.
+///
+/// It is used by the trainer to communicate with the ManagerServer.
+///
+/// Args:
+///     addr (str): The HTTP address of the manager server.
+///     connect_timeout (timedelta): The timeout for connecting to the manager server.
 #[pyclass]
 struct ManagerClient {
     runtime: Runtime,
@@ -108,7 +135,7 @@ impl ManagerClient {
         })
     }
 
-    fn quorum(
+    fn _quorum(
         &self,
         py: Python<'_>,
         rank: i64,
@@ -147,7 +174,7 @@ impl ManagerClient {
         })
     }
 
-    fn checkpoint_metadata(
+    fn _checkpoint_metadata(
         &self,
         py: Python<'_>,
         rank: i64,
@@ -168,6 +195,20 @@ impl ManagerClient {
         })
     }
 
+    /// should_commit makes a request to the manager to determine if the trainer
+    /// should commit the current step. This waits until all ranks check in at
+    /// the specified step and will return false if any worker passes
+    /// ``should_commit=False``.
+    ///
+    /// Args:
+    ///     rank (int): The rank of the trainer.
+    ///     step (int): The step of the trainer.
+    ///     should_commit (bool): Whether the trainer should commit the current step.
+    ///     timeout (timedelta): The timeout for the request. If the request
+    ///         times out a TimeoutError is raised.
+    ///
+    /// Returns:
+    ///    bool: Whether the trainer should commit the current step.
     fn should_commit(
         &self,
         py: Python<'_>,
@@ -263,15 +304,28 @@ async fn lighthouse_main_async(opt: lighthouse::LighthouseOpt) -> Result<()> {
     Ok(())
 }
 
+/// LighthouseServer is a GRPC server for the lighthouse service.
+///
+/// It is used to coordinate the ManagerServer for each replica group.
+///
+/// This entrypoint is primarily for testing and debugging purposes. The
+/// ``torchft_lighthouse`` command is recommended for most use cases.
+///
+/// Args:
+///     bind (str): The HTTP address to bind the server to.
+///     min_replicas (int): The minimum number of replicas required to form a quorum.
+///     join_timeout_ms (int): The timeout for joining the quorum.
+///     quorum_tick_ms (int): The interval at which the quorum is checked.
+///     heartbeat_timeout_ms (int): The timeout for heartbeats.
 #[pyclass]
-struct Lighthouse {
+struct LighthouseServer {
     lighthouse: Arc<lighthouse::Lighthouse>,
     handle: JoinHandle<Result<()>>,
     _runtime: Runtime,
 }
 
 #[pymethods]
-impl Lighthouse {
+impl LighthouseServer {
     #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None))]
     #[new]
     fn new(
@@ -307,10 +361,15 @@ impl Lighthouse {
         })
     }
 
+    /// address returns the address of the lighthouse server.
+    ///
+    /// Returns:
+    ///    str: The address of the lighthouse server.
     fn address(&self) -> PyResult<String> {
         Ok(self.lighthouse.address().to_string())
     }
 
+    /// shutdown shuts down the lighthouse server.
     fn shutdown(&self, py: Python<'_>) {
         py.allow_threads(move || {
             self.handle.abort();
@@ -339,7 +398,7 @@ impl From<Status> for StatusError {
 }
 
 #[pymodule]
-fn torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // setup logging on import
     let mut log = stderrlog::new();
     log.verbosity(2)
@@ -353,9 +412,9 @@ fn torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
     log.init()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    m.add_class::<Manager>()?;
+    m.add_class::<ManagerServer>()?;
     m.add_class::<ManagerClient>()?;
-    m.add_class::<Lighthouse>()?;
+    m.add_class::<LighthouseServer>()?;
     m.add_class::<QuorumResult>()?;
     m.add_function(wrap_pyfunction!(lighthouse_main, m)?)?;
 

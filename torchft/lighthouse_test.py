@@ -4,7 +4,7 @@ from unittest import TestCase
 import torch.distributed as dist
 
 from torchft import Manager, ProcessGroupGloo
-from torchft.torchft import Lighthouse
+from torchft._torchft import LighthouseServer
 
 
 class TestLighthouse(TestCase):
@@ -12,7 +12,7 @@ class TestLighthouse(TestCase):
         """Test that join_timeout_ms affects joining behavior"""
         # To test, we create a lighthouse with 100ms and 400ms join timeouts
         # and measure the time taken to validate the quorum.
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=1,
             join_timeout_ms=100,
@@ -52,14 +52,14 @@ class TestLighthouse(TestCase):
             if "manager" in locals():
                 manager.shutdown()
 
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=1,
             join_timeout_ms=400,
         )
 
     def test_heartbeat_timeout_ms_sanity(self) -> None:
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=1,
             heartbeat_timeout_ms=100,

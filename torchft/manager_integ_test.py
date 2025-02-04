@@ -14,12 +14,12 @@ import torch.distributed as dist
 from parameterized import parameterized
 from torch import nn, optim
 
+from torchft._torchft import LighthouseServer
 from torchft.ddp import DistributedDataParallel
 from torchft.local_sgd import DiLoCo, LocalSGD
 from torchft.manager import Manager
 from torchft.optim import OptimizerWrapper
 from torchft.process_group import ProcessGroupGloo
-from torchft.torchft import Lighthouse
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -348,7 +348,7 @@ class ManagerIntegTest(TestCase):
         self.assertLess(elapsed, timeout, msg)
 
     def test_ddp_healthy(self) -> None:
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=2,
         )
@@ -389,7 +389,7 @@ class ManagerIntegTest(TestCase):
         ]
     )
     def test_ddp_recovery(self, name: str, use_async_quorum: bool) -> None:
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=2,
         )
@@ -429,7 +429,7 @@ class ManagerIntegTest(TestCase):
         self.assertEqual(failure_injectors[1].count, 1)
 
     def test_ddp_recovery_multi_rank(self) -> None:
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=2,
         )
@@ -470,7 +470,7 @@ class ManagerIntegTest(TestCase):
             torch.testing.assert_close(state_dict, state_dicts[0])
 
     def test_local_sgd_recovery(self) -> None:
-        lighthouse = Lighthouse(
+        lighthouse = LighthouseServer(
             bind="[::]:0",
             min_replicas=2,
         )
@@ -621,7 +621,7 @@ class ManagerIntegTest(TestCase):
 
     def test_quorum_timeout(self) -> None:
         with ExitStack() as stack:
-            lighthouse = Lighthouse(
+            lighthouse = LighthouseServer(
                 bind="[::]:0",
                 min_replicas=2,
             )

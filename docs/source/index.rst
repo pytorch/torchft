@@ -21,6 +21,7 @@ the entire training job.
     data
     checkpointing
     parameter_server
+    coordination
 
 
 License
