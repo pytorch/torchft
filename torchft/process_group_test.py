@@ -238,14 +238,14 @@ class ProcessGroupTest(TestCase):
         assert future_thread_1 is not None
         self.assertFalse(future_thread_1.is_alive())
         assert future_queue_1 is not None
-        self.assertTrue(future_queue_1._closed)  # pyre-ignore[16]: no attribute _closed
+        self.assertTrue(future_queue_1.closed())
         assert p_1 is not None
         self.assertFalse(p_1.is_alive())
 
         assert future_thread_2 is not None
         self.assertTrue(future_thread_2.is_alive())
         assert future_queue_2 is not None
-        self.assertFalse(future_queue_2._closed)
+        self.assertFalse(future_queue_2.closed())
         assert p_2 is not None
         self.assertTrue(p_2.is_alive())
 
