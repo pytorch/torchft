@@ -17,7 +17,7 @@ runtime users need to take care to not assume a static rank or world size.
 """
 
 import logging
-import queue
+import sys
 import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -63,6 +63,8 @@ from torch.distributed.distributed_c10d import (
 from torch.futures import Future
 from torch.utils._pytree import tree_any
 
+from torchft.multiprocessing import _MonitoredQueue
+
 if TYPE_CHECKING:
     from torchft.manager import Manager
 
@@ -75,28 +77,6 @@ _FUTURE_EXCEPTION = "fut_exception"
 
 
 T = TypeVar("T")
-
-
-def _get(q: mp.Queue, timeout: Union[float, timedelta]) -> object:
-    """
-    Gets an item from a queue with a timeout. If the timeout is exceeded then
-    a TimeoutError is raised.
-
-    If an exception is returned from the queue then it is raised.
-
-    Args:
-        q: queue to get from
-        timeout: timeout in seconds
-    """
-    if isinstance(timeout, timedelta):
-        timeout = timeout.total_seconds()
-    try:
-        v = q.get(timeout=timeout)
-    except queue.Empty as e:
-        raise TimeoutError(f"queue.get() timed out after {timeout} seconds") from e
-    if isinstance(v, Exception):
-        raise v
-    return v
 
 
 def create_store_client(store_addr: str) -> Store:
@@ -573,8 +553,8 @@ class _BabyWork(Work):
     def __init__(
         self,
         pg: "ProcessGroupBaby",
-        tx: mp.Queue,
-        rx: mp.Queue,
+        tx: _MonitoredQueue,
+        rx: _MonitoredQueue,
         op_id: int,
         timeout: float,
     ) -> None:
@@ -592,7 +572,7 @@ class _BabyWork(Work):
         self._tx.put(("wait", self._op_id), timeout=self._timeout)
         op_id, event = cast(
             Tuple[int, Optional[torch.cuda.Event]],
-            _get(self._rx, timeout or self._timeout),
+            self._rx.get(timeout or self._timeout),
         )
         assert op_id == self._op_id
         if event is not None:
@@ -649,9 +629,9 @@ class ProcessGroupBaby(ProcessGroup):
         self._world_size = -1
 
         self._p: Optional[mp.Process] = None
-        self._tx: Optional[mp.Queue] = None
-        self._rx: Optional[mp.Queue] = None
-        self._future_queue: Optional[mp.Queue] = None
+        self._tx: Optional[_MonitoredQueue] = None
+        self._rx: Optional[_MonitoredQueue] = None
+        self._future_queue: Optional[_MonitoredQueue] = None
         self._future_thread: Optional[threading.Thread] = None
         self._futures: Dict[int, Future[object]] = {}
         self._futures_lock = threading.Lock()
@@ -661,60 +641,80 @@ class ProcessGroupBaby(ProcessGroup):
 
         self._timeout: float = timeout
 
-    def configure(self, store_addr: str, rank: int, world_size: int) -> None:
-        if self._p is not None:
-            self._p.kill()
+    def shutdown(self) -> None:
+        """
+        Shutdown the process group. This will kill the underlying process and
+        close all queues.
 
-        self._world_size = world_size
+        This is a no-op if the process group is already shutdown.
+
+        ProcessGroup can be reconfigured after shutdown.
+        """
 
         if self._tx is not None:
             self._tx.close()
         if self._rx is not None:
             self._rx.close()
-        if self._future_queue is not None:
+
+        future_queue = self._future_queue
+        if future_queue is not None:
             # wait for the future thread to exit and then close the queue
-            self._future_queue.put(_QUEUE_CLOSE)
-            assert self._future_thread is not None
-            self._future_thread.join(timeout=10.0)
-            # pyre-ignore[16]: optional value is checked above
-            if self._future_thread.is_alive():
+            future_queue.put(_QUEUE_CLOSE, timeout=timedelta(seconds=10.0))
+
+            future_thread = self._future_thread
+            assert future_thread is not None
+            future_thread.join(timeout=10.0)
+            if future_thread.is_alive():
                 raise RuntimeError("future thread did not exit")
-            # pyre-ignore[16]: optional value is checked above
-            self._future_queue.close()
+
+            future_queue.close()
+
+        # Kill after closing queues to avoid log spam.
+        if self._p is not None:
+            self._p.kill()
+
+    def configure(self, store_addr: str, rank: int, world_size: int) -> None:
+        self._world_size = world_size
+
+        self.shutdown()
 
         ctx = mp.get_context("spawn")
-        self._tx = ctx.Queue()
-        self._rx = rx = ctx.Queue()
+        tx = ctx.Queue()
+        rx = ctx.Queue()
+        future_queue = ctx.Queue()
 
-        # futures need thread to fire callbacks
-        self._future_queue = ctx.Queue()
-        # this lock needs to be held when manipulating _futures
-        self._futures_lock = threading.Lock()
-        self._futures = {}
-        self._future_thread = threading.Thread(
-            target=self._future_handler,
-            args=(self._future_queue,),
-            daemon=True,
-        )
-        self._future_thread.start()
-
-        self._p = ctx.Process(
+        self._p = p = ctx.Process(
             target=self._worker,
             args=(
                 store_addr,
                 rank,
                 world_size,
-                self._tx,
-                self._rx,
-                self._future_queue,
+                tx,
+                rx,
+                future_queue,
             ),
             daemon=True,
         )
-        self._p.start()
+        p.start()
+
+        self._tx = tx = _MonitoredQueue(p, tx)
+        self._rx = rx = _MonitoredQueue(p, rx)
+        self._future_queue = future_queue = _MonitoredQueue(p, future_queue)
+
+        # futures need thread to fire callbacks
+        # this lock needs to be held when manipulating _futures
+        self._futures_lock = threading.Lock()
+        self._futures = {}
+        self._future_thread = threading.Thread(
+            target=self._future_handler,
+            args=(future_queue,),
+            daemon=True,
+        )
+        self._future_thread.start()
 
         # fetch the status of the PG init
-        # if an exception was returned _get will throw
-        assert _get(rx, self._timeout) is None
+        # if an exception was returned get will throw
+        assert rx.get(self._timeout) is None
 
     @classmethod
     def _create_pg(cls, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
@@ -739,7 +739,7 @@ class ProcessGroupBaby(ProcessGroup):
             try:
                 pg = cls._create_pg(store, rank, world_size)
             except Exception as e:
-                logger.exception(f"got exception in worker: {e}")
+                print(f"got exception in worker: {e}", file=sys.stderr)
                 tx.put(e)
                 return
             tx.put(None)
@@ -829,17 +829,21 @@ class ProcessGroupBaby(ProcessGroup):
                     raise ValueError(f"unknown cmd: {cmd}")
 
         except Exception as e:
-            logger.exception("worker errored")
+            print(f"worker errored: {e}", file=sys.stderr)
             tx.put(e)
             raise
 
-    def _future_handler(self, future_queue: mp.Queue) -> None:
+    def _future_handler(self, future_queue: _MonitoredQueue) -> None:
         try:
             while True:
-                cmd = future_queue.get()
+                try:
+                    # timeout doesn't really matter here
+                    cmd = future_queue.get(timeout=timedelta(seconds=10.0))
+                except TimeoutError:
+                    continue
                 if cmd == _QUEUE_CLOSE:
                     break
-                op_id, mode, data = cmd
+                op_id, mode, data = cast(Tuple[int, str, object], cmd)
                 with self._futures_lock:
                     fut = self._futures[op_id]
                     del self._futures[op_id]
@@ -862,7 +866,7 @@ class ProcessGroupBaby(ProcessGroup):
             self._tx.put(("future", op_id), timeout=self._timeout)
 
         assert self._rx is not None
-        assert _get(self._rx, self._timeout) == op_id
+        assert self._rx.get(self._timeout) == op_id
         # TODO: return correct tensor instead of None
         return fut
 
@@ -899,7 +903,7 @@ class ProcessGroupBaby(ProcessGroup):
             timeout=self._timeout,
         )
 
-        op_id = _get(rx, self._timeout)
+        op_id = rx.get(self._timeout)
         assert isinstance(op_id, int), f"invalid return {op_id}"
 
         return _BabyWork(pg=self, tx=tx, rx=rx, op_id=op_id, timeout=self._timeout)
@@ -968,7 +972,7 @@ class ProcessGroupBaby(ProcessGroup):
         self._tx.put(("num_active_work",), timeout=self._timeout)
 
         assert self._rx is not None
-        return cast(int, _get(self._rx, self._timeout))
+        return cast(int, self._rx.get(self._timeout))
 
 
 @dataclass
