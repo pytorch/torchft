@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import threading
+import unittest
 import urllib.error
 from datetime import timedelta
 from unittest import TestCase
@@ -103,3 +104,7 @@ class TestCheckpointing(TestCase):
                 pass
 
         self.assertTrue(lock.locked())
+
+
+if __name__ == "__main__":
+    unittest.main()

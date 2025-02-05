@@ -20,11 +20,10 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler
-from typing import Generator, Generic, List, Optional, TypeVar
-
-import torch
+from typing import Generator, Generic, List, Optional, TypeVar, cast
 
 from torchft.http import _IPv6HTTPServer
+from torchft.serialization import streaming_load, streaming_save
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -161,7 +160,7 @@ class CheckpointServer(CheckpointTransport[T]):
 
                         state_dict = ckpt_server._state_dict
 
-                        torch.save(state_dict, self.wfile)
+                        streaming_save(state_dict, self.wfile)
                 except Exception as e:
                     logger.exception(
                         f"Exception in checkpoint server when handling {self.path=}: {e}",
@@ -198,9 +197,8 @@ class CheckpointServer(CheckpointTransport[T]):
             data = f.read()
 
         reader = io.BytesIO(data)
-        # We have to set weights_only to False as there are some non-tensor
-        # states like lr_scheduler.
-        return torch.load(reader, weights_only=False)
+        state_dict = streaming_load(reader)
+        return cast(T, state_dict)
 
     def address(self) -> str:
         """
