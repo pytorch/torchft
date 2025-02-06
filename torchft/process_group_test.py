@@ -23,6 +23,7 @@ from torch._C._distributed_c10d import (
     AllreduceOptions,
     BroadcastOptions,
     ReduceOp,
+    ReduceScatterOptions,
     _resolve_process_group,
 )
 from torch.distributed import (
@@ -60,6 +61,31 @@ def dummy_init_pg() -> None:
         )
 
 
+def _should_run_collective(collective_str: str, backend_str: str, device: str) -> bool:
+    """Verify if the collective is supported by the backend and device.
+
+    See https://pytorch.org/docs/stable/distributed.html#backends for the
+    supported collectives / backends / devices matrix.
+
+    """
+    if "nccl" in backend_str.lower():
+        # all collectives are supported for NCCL/CUDA but none on CPU.
+        return device == "cuda"
+    elif "gloo" in backend_str.lower():
+        if device == "cuda":
+            # GLOO/GPU only supports broadcast and all_reduce.
+            if collective_str in ["broadcast", "all_reduce"]:
+                return True
+            return False
+        else:  # cpu
+            if collective_str in ["reduce_scatter", "all_to_all"]:
+                return False
+            return True
+    else:
+        # Non defined backends (e.g. ErrorSwallowing) should continue to work.
+        return True
+
+
 def _test_pg(
     pg: ProcessGroup,
     example_tensor: torch.Tensor = torch.randn((2, 3), dtype=torch.float32),
@@ -94,9 +120,25 @@ def _test_pg(
         ("allgather", (output_tensors, [input_tensor], AllgatherOptions())),
         ("broadcast", (tensor_list, BroadcastOptions())),
         ("broadcast_one", (input_tensor, 0)),
+        (
+            "reduce_scatter",
+            (output_tensors[0], [[input_tensor]], ReduceScatterOptions()),
+        ),
     ]
     works: Dict[str, dist._Work] = {}
+
+    try:
+        backend_str = pg.getBackendName()
+        device = example_tensor.device
+        if type(device) is torch.device:
+            device = device.type
+    except NotImplementedError as e:
+        backend_str = ""
+        device = ""
+
     for coll_str, args in collectives:
+        if not _should_run_collective(coll_str, backend_str=backend_str, device=device):
+            continue
         coll = getattr(pg, coll_str)
         work = coll(*args)
         works[coll_str] = work

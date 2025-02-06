@@ -58,6 +58,7 @@ from torch.distributed.distributed_c10d import (
     AllreduceOptions,
     BroadcastOptions,
     ReduceOp,
+    ReduceScatterOptions,
     Work,
 )
 from torch.futures import Future
@@ -180,6 +181,20 @@ class ProcessGroup(BaseProcessGroup):
         opts.rootRank = root
         return self.broadcast([tensor], opts)
 
+    # pyre-fixme[14]: inconsistent override
+    def reduce_scatter(
+        self,
+        output_tensors: List[torch.Tensor],
+        input_tensors: List[List[torch.Tensor]],
+        opts: ReduceScatterOptions,
+    ) -> Work:
+        """
+        Reduces, then scatters a list of tensors to all processes in a group.
+
+        See torch.distributed.reduce_scatter for more details.
+        """
+        raise NotImplementedError("not implemented")
+
     def size(self) -> int:
         raise NotImplementedError("not implemented")
 
@@ -288,6 +303,14 @@ class ProcessGroupWrapper(ProcessGroup):
     def broadcast(self, tensor_list: List[torch.Tensor], opts: object) -> Work:
         return self.parent.broadcast(tensor_list, opts)
 
+    def reduce_scatter(
+        self,
+        output_tensors: List[torch.Tensor],
+        input_tensors: List[List[torch.Tensor]],
+        opts: object,
+    ) -> Work:
+        return self.parent.reduce_scatter(output_tensors, input_tensors, opts)
+
     def size(self) -> int:
         return self.parent.size()
 
@@ -375,11 +398,6 @@ class ProcessGroupDummy(ProcessGroup):
     def configure(self, store_addr: str, rank: int, world_size: int) -> None:
         self.configure_count += 1
 
-    def broadcast(self, tensor_list: List[torch.Tensor], opts: object) -> Work:
-        res = _DummyWork(tensor_list)
-        self._work.append(res)
-        return res
-
     def allgather(
         self,
         output_tensors: List[List[torch.Tensor]],
@@ -395,6 +413,24 @@ class ProcessGroupDummy(ProcessGroup):
 
     def allreduce(self, tensors: List[torch.Tensor], opts: object) -> Work:
         res = _DummyWork(tensors)
+        self._work.append(res)
+        return res
+
+    def broadcast(self, tensor_list: List[torch.Tensor], opts: object) -> Work:
+        res = _DummyWork(tensor_list)
+        self._work.append(res)
+        return res
+
+    def reduce_scatter(
+        self,
+        output_tensors: List[torch.Tensor],
+        input_tensors: List[List[torch.Tensor]],
+        opts: object,
+    ) -> Work:
+        for o, i in zip(output_tensors, input_tensors[0]):
+            o.copy_(i)
+
+        res = _DummyWork(output_tensors)
         self._work.append(res)
         return res
 
@@ -959,6 +995,25 @@ class ProcessGroupBaby(ProcessGroup):
                 tensor.share_memory_()
 
         return self._run_func("broadcast", tensor_list, opts)
+
+    def reduce_scatter(
+        self,
+        output_tensors: List[torch.Tensor],
+        input_tensors: List[List[torch.Tensor]],
+        opts: ReduceScatterOptions,
+    ) -> Work:
+        assert isinstance(output_tensors, list), "input must be list"
+        assert isinstance(input_tensors, list), "input must be list"
+
+        for tensor in output_tensors:
+            if not tensor.is_shared():
+                tensor.share_memory_()
+
+        for tensor_list in input_tensors:
+            for tensor in tensor_list:
+                if not tensor.is_shared():
+                    tensor.share_memory_()
+        return self._run_func("reduce_scatter", output_tensors, input_tensors, opts)
 
     def size(self) -> int:
         return self._world_size
