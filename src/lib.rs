@@ -15,17 +15,18 @@ use std::env;
 use std::sync::Arc;
 
 use anyhow::Result;
+use log::info;
 use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
 use structopt::StructOpt;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use tonic::transport::Channel;
 use tonic::Status;
 
 pub mod torchftpb {
     tonic::include_proto!("torchft");
 }
 
+use crate::net::Channel;
 use crate::torchftpb::manager_service_client::ManagerServiceClient;
 use crate::torchftpb::{CheckpointMetadataRequest, ManagerQuorumRequest, ShouldCommitRequest};
 use pyo3::prelude::*;
@@ -338,8 +339,7 @@ impl From<Status> for StatusError {
     }
 }
 
-#[pymodule]
-fn torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn init_logging() -> PyResult<()> {
     // setup logging on import
     let mut log = stderrlog::new();
     log.verbosity(2)
@@ -352,6 +352,92 @@ fn torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     log.init()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(())
+}
+
+fn init_tracing() -> PyResult<()> {
+    use opentelemetry::trace::Tracer;
+    use opentelemetry::trace::TracerProvider as OpenTelemetryTracerProvider;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::trace::TracerProvider;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{filter::EnvFilter, Layer};
+
+    fn set_tracer_provider(tracer_provider: TracerProvider) -> PyResult<()> {
+        opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+
+        let layer = tracing_opentelemetry::layer()
+            .with_error_records_to_exceptions(true)
+            .with_tracer(tracer_provider.tracer(""));
+
+        // Create a new tracing::Fmt layer to print the logs to stdout. It has a
+        // default filter of `info` level and above, and `debug` and above for logs
+        // from OpenTelemetry crates. The filter levels can be customized as needed.
+        let filter_fmt =
+            EnvFilter::new("info").add_directive("opentelemetry=debug".parse().unwrap());
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_thread_names(true)
+            .with_filter(filter_fmt);
+
+        let subscriber = tracing_subscriber::registry().with(fmt_layer).with(layer);
+        tracing::subscriber::set_global_default(subscriber)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        info!("OpenTelemetry tracing enabled");
+
+        Ok(())
+    }
+
+    match env::var("TORCHFT_OTEL_OTLP") {
+        Ok(endpoint) => {
+            let runtime = Runtime::new()?;
+
+            runtime.block_on(async move {
+                info!("Enabling OpenTelemetry OTLP with {}", endpoint);
+                let exporter = opentelemetry_otlp::SpanExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .with_timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                let tracer_provider = TracerProvider::builder()
+                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                    .build();
+
+                set_tracer_provider(tracer_provider)?;
+
+                Ok::<(), pyo3::PyErr>(())
+            })?;
+        }
+        Err(_) => {}
+    };
+    match env::var("TORCHFT_OTEL_STDOUT") {
+        Ok(_) => {
+            info!("Enabling OpenTelemetry stdout");
+            let exporter = opentelemetry_stdout::SpanExporter::default();
+            let tracer_provider = TracerProvider::builder()
+                .with_simple_exporter(exporter)
+                .build();
+
+            set_tracer_provider(tracer_provider)?;
+        }
+        Err(_) => {}
+    }
+
+    let tracer = opentelemetry::global::tracer("my_tracer");
+    tracer.in_span("doing_work", |cx| {
+        // Traced app logic here...
+    });
+
+    Ok(())
+}
+
+#[pymodule]
+fn torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_logging()?;
+    init_tracing()?;
 
     m.add_class::<Manager>()?;
     m.add_class::<ManagerClient>()?;

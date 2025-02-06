@@ -19,6 +19,18 @@ stderrlog = "0.6.0"
 structopt = "0.3.26"
 tokio = {version = "1.40.0", features = ["full", "test-util", "tracing", "macros", "rt-multi-thread"] }
 tonic = "0.12.2"
+opentelemetry_sdk = { version = "*", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "*", features = ["grpc-tonic"] }
+opentelemetry = "0.27.1"
+tonic-tracing-opentelemetry = "0.24.3"
+tower = "0.5.2"
+tracing-opentelemetry-instrumentation-sdk = "0.24.1"
+http = "1.2.0"
+axum-tracing-opentelemetry = "0.25.0"
+opentelemetry-stdout = "0.27.0"
+tracing-subscriber = { version="0.3.19", features = ["fmt", "env-filter"]}
+tracing-opentelemetry = "0.28.0"
+tracing = "0.1.41"
 
 [build-dependencies]
 tonic-build = "0.12.2"

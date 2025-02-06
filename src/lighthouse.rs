@@ -20,6 +20,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use axum_tracing_opentelemetry::middleware::{OtelAxumLayer, OtelInResponseLayer};
 use gethostname::gethostname;
 use log::{error, info};
 use structopt::StructOpt;
@@ -31,6 +32,7 @@ use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 
 use crate::manager::manager_client_new;
 use crate::torchftpb::{
@@ -343,12 +345,17 @@ impl Lighthouse {
                     let self_clone = self.clone();
                     move |path| async { self_clone.kill(path).await }
                 }),
-            );
+            )
+            // include trace context as header into the response
+            .layer(OtelInResponseLayer::default())
+            //start OpenTelemetry trace on incoming request
+            .layer(OtelAxumLayer::default());
 
         // register the GRPC service
         let routes = Routes::from(app).add_service(LighthouseServiceServer::new(self));
 
         Server::builder()
+            .layer(OtelGrpcLayer::default())
             // allow non-GRPC connections
             .accept_http1(true)
             .add_routes(routes)
@@ -569,9 +576,7 @@ mod tests {
     use super::*;
     use std::ops::Sub;
 
-    use tonic::transport::Channel;
-
-    use crate::net::connect;
+    use crate::net::{connect, Channel};
     use crate::torchftpb::lighthouse_service_client::LighthouseServiceClient;
 
     async fn lighthouse_client_new(addr: String) -> Result<LighthouseServiceClient<Channel>> {

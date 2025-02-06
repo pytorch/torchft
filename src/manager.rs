@@ -16,11 +16,11 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::Channel;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 
-use crate::net::connect;
+use crate::net::{connect, Channel};
 use crate::timeout::try_parse_grpc_timeout;
 use crate::torchftpb::lighthouse_service_client::LighthouseServiceClient;
 use crate::torchftpb::manager_service_client::ManagerServiceClient;
@@ -64,8 +64,9 @@ pub async fn manager_client_new(
     connect_timeout: Duration,
 ) -> Result<ManagerServiceClient<Channel>> {
     info!("ManagerClient: establishing connection to {}", &addr);
-    let conn = connect(addr, connect_timeout).await?;
-    Ok(ManagerServiceClient::new(conn))
+    let channel = connect(addr, connect_timeout).await?;
+
+    Ok(ManagerServiceClient::new(channel))
 }
 
 pub async fn lighthouse_client_new(
@@ -73,8 +74,8 @@ pub async fn lighthouse_client_new(
     connect_timeout: Duration,
 ) -> Result<LighthouseServiceClient<Channel>> {
     info!("LighthouseClient: establishing connection to {}", &addr);
-    let conn = connect(addr, connect_timeout).await?;
-    Ok(LighthouseServiceClient::new(conn))
+    let channel = connect(addr, connect_timeout).await?;
+    Ok(LighthouseServiceClient::new(channel))
 }
 
 impl Manager {
@@ -146,6 +147,7 @@ impl Manager {
             TcpIncoming::from_listener(listener, true, None).map_err(|e| anyhow::anyhow!(e))?;
 
         Server::builder()
+            .layer(OtelGrpcLayer::default())
             .add_service(ManagerServiceServer::new(self))
             .serve_with_incoming(incoming)
             .await

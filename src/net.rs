@@ -1,12 +1,16 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Endpoint;
+use tonic_tracing_opentelemetry::middleware::client::{OtelGrpcLayer, OtelGrpcService};
+use tower::ServiceBuilder;
 
 use crate::retry::{retry_backoff, ExponentialBackoff};
 
+pub type Channel = OtelGrpcService<tonic::transport::Channel>;
+
 pub async fn connect_once(addr: String, connect_timeout: Duration) -> Result<Channel> {
-    let conn = Endpoint::new(addr)?
+    let channel = Endpoint::new(addr)?
         .connect_timeout(connect_timeout)
         // Enable HTTP2 keep alives
         .http2_keep_alive_interval(Duration::from_secs(60))
@@ -16,7 +20,9 @@ pub async fn connect_once(addr: String, connect_timeout: Duration) -> Result<Cha
         .keep_alive_while_idle(true)
         .connect()
         .await?;
-    Ok(conn)
+    let channel = ServiceBuilder::new().layer(OtelGrpcLayer).service(channel);
+
+    Ok(channel)
 }
 
 pub async fn connect(addr: String, connect_timeout: Duration) -> Result<Channel> {
