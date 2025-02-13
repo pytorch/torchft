@@ -10,7 +10,7 @@ This module implements a fault tolerant version of LocalSGD and related methods.
 """
 import logging
 from types import TracebackType
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Type
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type
 
 import torch
 from torch import nn, optim
@@ -108,9 +108,6 @@ class LocalSGD:
         traceback: Optional[TracebackType],
     ) -> bool:
         # Handle any cleanup or error handling here
-        if exc_type is not None:
-            # If an exception occurred, restore parameters
-            self._restore_parameters()
         # Clean up hooks
         for hook in self._hooks:
             hook.remove()
@@ -131,14 +128,18 @@ class LocalSGD:
                 p.data.copy_(self._backup_parameters[name], non_blocking=False)
 
     def _step_post_hook(
-        self, _optim: optim.Optimizer, _args: List[object], _kwargs: Dict[str, object]
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
     ) -> None:
         """
         This hook is registered on the optimizer and is called after the optimizer step.
         """
-        self._local_step += 1
-        if self._local_step >= self._sync_every:
-            self.sync()
+        try:
+            self._local_step += 1
+            if self._local_step >= self._sync_every:
+                self.sync()
+        except Exception as e:
+            self._manager.report_error(e)
+            raise
 
     def sync(self) -> None:
         """
@@ -157,9 +158,6 @@ class LocalSGD:
         self._average()
         if self._manager.should_commit():
             self._save_parameters()
-        else:
-            # commit failed, restore from the backup parameters
-            self._restore_parameters()
 
     def _average(self) -> None:
         # TODO: do we need to broadcast buffers like DDP does?
@@ -207,10 +205,13 @@ class DiLoCo(LocalSGD):
         Overrides the sync method to calculate the pseugradient, average them across the manager group, and
         step using the outer optimizer.
         """
+        print("Performing DiLoCo sync", flush=True)
 
         # Set the .grad field of each parameter to its pseudogradient
         for name, p in self._model.named_parameters():
             assert name in self._backup_parameters
+            print(p.data.device, flush=True)
+            print(self._backup_parameters[name].device, flush=True)
             pseudogradient = p.data - self._backup_parameters[name]
             p.grad = pseudogradient
 
