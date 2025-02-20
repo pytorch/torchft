@@ -144,3 +144,57 @@ class DiLoCoTest(TestCase):
 
             outer_opt_state = outer_optimizer.state_dict()
             self.assertEqual(len(outer_opt_state["state"]), parameter_count)
+
+    def test_diloco_without_bucketization(self):
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(
+            model.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
+        )
+        outer_optimizer = optim.SGD(
+            model.parameters(), lr=0.7, momentum=0.9, nesterov=True
+        )
+        manager = create_autospec(Manager)
+        manager._use_async_quorum = False
+
+        with DiLoCo(
+            manager,
+            model,
+            inner_optimizer,
+            outer_optimizer,
+            sync_every=2,
+            use_bucketization=False,
+        ) as diloco:
+            inp = torch.rand(2, 3)
+            loss = model(inp).mean()
+            loss.backward()
+            inner_optimizer.step()
+            self.assertEqual(diloco._local_step, 1)
+            self.assertEqual(
+                manager.allreduce.call_count, len(list(model.parameters()))
+            )
+
+    def test_diloco_with_bucketization(self):
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(
+            model.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
+        )
+        outer_optimizer = optim.SGD(
+            model.parameters(), lr=0.7, momentum=0.9, nesterov=True
+        )
+        manager = create_autospec(Manager)
+        manager._use_async_quorum = False
+
+        with DiLoCo(
+            manager,
+            model,
+            inner_optimizer,
+            outer_optimizer,
+            sync_every=2,
+            use_bucketization=True,
+        ) as diloco:
+            inp = torch.rand(2, 3)
+            loss = model(inp).mean()
+            loss.backward()
+            inner_optimizer.step()
+            self.assertEqual(diloco._local_step, 1)
+            self.assertGreaterEqual(manager.allreduce.call_count, 1)
