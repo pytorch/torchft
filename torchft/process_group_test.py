@@ -574,30 +574,30 @@ class ProcessGroupTest(TestCase):
         a = ProcessGroupBabyGloo()
         a.configure(store_addr, 0, 1)
         future_thread_1 = a._future_thread
-        future_queue_1 = a._future_queue
+        future_pipe_1 = a._future_pipe
         p_1 = a._p
 
         store_addr = f"localhost:{store.port}/prefix2"
         a.configure(store_addr, 0, 1)
         future_thread_2 = a._future_thread
-        future_queue_2 = a._future_queue
+        future_pipe_2 = a._future_pipe
         p_2 = a._p
 
         self.assertNotEqual(future_thread_1, future_thread_2)
-        self.assertNotEqual(future_queue_1, future_queue_2)
+        self.assertNotEqual(future_pipe_1, future_pipe_2)
         self.assertNotEqual(p_1, p_2)
 
         assert future_thread_1 is not None
         self.assertFalse(future_thread_1.is_alive())
-        assert future_queue_1 is not None
-        self.assertTrue(future_queue_1.closed())
+        assert future_pipe_1 is not None
+        self.assertTrue(future_pipe_1.closed())
         assert p_1 is not None
         self.assertFalse(p_1.is_alive())
 
         assert future_thread_2 is not None
         self.assertTrue(future_thread_2.is_alive())
-        assert future_queue_2 is not None
-        self.assertFalse(future_queue_2.closed())
+        assert future_pipe_2 is not None
+        self.assertFalse(future_pipe_2.closed())
         assert p_2 is not None
         self.assertTrue(p_2.is_alive())
 
