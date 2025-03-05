@@ -21,6 +21,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
+from multiprocessing.connection import Connection
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -66,7 +67,7 @@ from torch.distributed.distributed_c10d import (
 from torch.futures import Future
 from torch.utils._pytree import tree_any
 
-from torchft.multiprocessing import _MonitoredQueue
+from torchft.multiprocessing import _MonitoredPipe
 
 if TYPE_CHECKING:
     from torchft.manager import Manager
@@ -916,12 +917,13 @@ class ProcessGroupBaby(ProcessGroup):
         self._world_size = -1
 
         self._p: Optional[mp.Process] = None
-        self._tx: Optional[_MonitoredQueue] = None
-        self._rx: Optional[_MonitoredQueue] = None
-        self._future_queue: Optional[_MonitoredQueue] = None
+        self._pipe: Optional[_MonitoredPipe] = None
+        self._future_pipe: Optional[_MonitoredPipe] = None
         self._future_thread: Optional[threading.Thread] = None
         self._futures: Dict[int, Future[object]] = {}
         self._futures_lock = threading.Lock()
+
+        self._next_op_id = 0
 
         if isinstance(timeout, timedelta):
             timeout = timeout.total_seconds()
@@ -938,15 +940,13 @@ class ProcessGroupBaby(ProcessGroup):
         ProcessGroup can be reconfigured after shutdown.
         """
 
-        if self._tx is not None:
-            self._tx.close()
-        if self._rx is not None:
-            self._rx.close()
+        if self._pipe is not None:
+            self._pipe.close()
 
-        future_queue = self._future_queue
-        if future_queue is not None:
+        future_pipe = self._future_pipe
+        if future_pipe is not None:
             # wait for the future thread to exit and then close the queue
-            future_queue.put(_QUEUE_CLOSE, timeout=timedelta(seconds=10.0))
+            future_pipe.send(_QUEUE_CLOSE)
 
             future_thread = self._future_thread
             assert future_thread is not None
@@ -954,7 +954,7 @@ class ProcessGroupBaby(ProcessGroup):
             if future_thread.is_alive():
                 raise RuntimeError("future thread did not exit")
 
-            future_queue.close()
+            future_pipe.close()
 
         # Kill after closing queues to avoid log spam.
         if self._p is not None:
@@ -966,9 +966,8 @@ class ProcessGroupBaby(ProcessGroup):
         self.shutdown()
 
         ctx = mp.get_context("spawn")
-        tx = ctx.Queue()
-        rx = ctx.Queue()
-        future_queue = ctx.Queue()
+        req_local, req_remote = ctx.Pipe()
+        future_local, future_remote = ctx.Pipe()
 
         self._p = p = ctx.Process(
             target=self._worker,
@@ -976,17 +975,15 @@ class ProcessGroupBaby(ProcessGroup):
                 store_addr,
                 rank,
                 world_size,
-                tx,
-                rx,
-                future_queue,
+                req_remote,
+                future_remote,
             ),
             daemon=True,
         )
         p.start()
 
-        self._tx = tx = _MonitoredQueue(p, tx)
-        self._rx = rx = _MonitoredQueue(p, rx)
-        self._future_queue = future_queue = _MonitoredQueue(p, future_queue)
+        self._pipe = req_local = _MonitoredPipe(req_local)
+        self._future_pipe = future_local = _MonitoredPipe(future_local)
 
         # futures need thread to fire callbacks
         # this lock needs to be held when manipulating _futures
@@ -994,14 +991,14 @@ class ProcessGroupBaby(ProcessGroup):
         self._futures = {}
         self._future_thread = threading.Thread(
             target=self._future_handler,
-            args=(future_queue,),
+            args=(future_local,),
             daemon=True,
         )
         self._future_thread.start()
 
         # fetch the status of the PG init
         # if an exception was returned get will throw
-        assert rx.get(self._timeout) is None
+        assert req_local.recv(self._timeout) is None
 
     @classmethod
     def _create_pg(cls, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
@@ -1016,9 +1013,8 @@ class ProcessGroupBaby(ProcessGroup):
         store_addr: str,
         rank: int,
         world_size: int,
-        rx: mp.Queue,
-        tx: mp.Queue,
-        future_queue: mp.Queue,
+        req_pipe: "Connection[object, object]",
+        future_pipe: "Connection[object, object]",
     ) -> None:
         try:
             store = create_store_client(store_addr)
@@ -1027,19 +1023,32 @@ class ProcessGroupBaby(ProcessGroup):
                 pg = cls._create_pg(store, rank, world_size)
             except Exception as e:
                 logger.exception(f"got exception in worker: {e}")
-                tx.put(e)
+                req_pipe.send(e)
                 return
-            tx.put(None)
+            req_pipe.send(None)
 
             streams: Dict[str, torch.cuda.Stream] = {}
             work: Dict[int, _OpMetadata] = {}
-            next_op_id: int = 0
 
             while True:
-                op = rx.get()
+                op = cast(list[object], req_pipe.recv())
                 cmd = op[0]
                 if cmd == "func":
-                    func_name, args, kwargs, stream_device, stream_id, event = op[1:]
+                    op_id: int
+                    op_id, func_name, args, kwargs, stream_device, stream_id, event = (
+                        cast(
+                            Tuple[
+                                int,
+                                str,
+                                list[object],
+                                dict[str, object],
+                                int,
+                                int,
+                                Optional[torch.cuda.Event],
+                            ],
+                            op[1:],
+                        )
+                    )
 
                     # To avoid potential deadlocks we need to preserve the
                     # stream/synchronization behavior of the parent process.
@@ -1068,15 +1077,12 @@ class ProcessGroupBaby(ProcessGroup):
 
                         args = _PickleSafeOptions.unsafe_args(args)
                         fn = getattr(pg, func_name)
-                        work[next_op_id] = _OpMetadata(
+                        work[op_id] = _OpMetadata(
                             work=fn(*args, **kwargs),
                             stream=stream,
                         )
-                    tx.put(next_op_id)
-                    next_op_id += 1
                 elif cmd == "wait":
-                    op_id: int = op[1]
-                    timeout: Optional[timedelta] = op[2]
+                    op_id, timeout = cast(tuple[int, timedelta], op[1:])
 
                     metadata = work[op_id]
 
@@ -1098,40 +1104,39 @@ class ProcessGroupBaby(ProcessGroup):
                             else None
                         )
 
-                    tx.put((op_id, event))
+                    req_pipe.send((op_id, event))
                 elif cmd == "del":
-                    op_id: int = op[1]
+                    op_id: int = cast(int, op[1])
                     del work[op_id]
                 elif cmd == "future":
-                    op_id: int = op[1]
+                    op_id: int = cast(int, op[1])
 
                     def callback(fut: Future[object]) -> None:
                         try:
                             fut.wait()
-                            future_queue.put((op_id, _FUTURE_RESULT, None))
+                            future_pipe.send((op_id, _FUTURE_RESULT, None))
                         except Exception as e:
-                            future_queue.put((op_id, _FUTURE_EXCEPTION, e))
+                            future_pipe.send((op_id, _FUTURE_EXCEPTION, e))
 
                     work[op_id].work.get_future().add_done_callback(callback)
-                    tx.put(op_id)
                 elif cmd == "num_active_work":
-                    tx.put(len(work))
+                    req_pipe.send(len(work))
                 else:
                     raise ValueError(f"unknown cmd: {cmd}")
 
         except Exception as e:
             logger.exception(f"worker errored: {e}")
-            tx.put(e)
+            req_pipe.send(e)
             raise
 
-    def _future_handler(self, future_queue: _MonitoredQueue) -> None:
+    def _future_handler(self, future_pipe: _MonitoredPipe) -> None:
         try:
             while True:
                 try:
-                    # timeout doesn't really matter here
-                    cmd = future_queue.get(timeout=timedelta(seconds=10.0))
+                    cmd = future_pipe.recv(timedelta(seconds=10))
                 except TimeoutError:
                     continue
+
                 if cmd == _QUEUE_CLOSE:
                     break
                 op_id, mode, data = cast(Tuple[int, str, object], cmd)
@@ -1151,22 +1156,20 @@ class ProcessGroupBaby(ProcessGroup):
         with self._futures_lock:
             fut = Future()  # pyre-fixme[29]: is not a function
             self._futures[op_id] = fut
-            assert self._tx is not None
-            self._tx.put(("future", op_id), timeout=self._timeout)
+            assert self._pipe is not None
+            self._pipe.send(("future", op_id))
 
-        assert self._rx is not None
-        assert self._rx.get(self._timeout) == op_id
         # TODO: return correct tensor instead of None
         return fut
 
     def _wait(self, op_id: int, timeout: Optional[timedelta] = None) -> bool:
-        assert self._tx is not None
-        self._tx.put(("wait", op_id, timeout), timeout=self._timeout)
+        assert self._pipe is not None
+        self._pipe.send(("wait", op_id, timeout))
 
-        assert self._rx is not None
+        assert self._pipe is not None
         op_id, event = cast(
             Tuple[int, Optional[torch.cuda.Event]],
-            self._rx.get(timeout or self._timeout),
+            self._pipe.recv(timeout or self._timeout),
         )
         assert op_id == op_id
         if event is not None:
@@ -1175,14 +1178,12 @@ class ProcessGroupBaby(ProcessGroup):
         return True
 
     def _del(self, op_id: int) -> None:
-        assert self._tx is not None
-        self._tx.put(("del", op_id), timeout=self._timeout)
+        assert self._pipe is not None
+        self._pipe.send(("del", op_id))
 
     def _run_func(self, func: str, *args: object, **kwargs: object) -> Work:
-        rx = self._rx
-        tx = self._tx
-        assert rx is not None
-        assert tx is not None
+        pipe = self._pipe
+        assert pipe is not None
 
         is_cuda = _is_any_cuda(args)
 
@@ -1196,9 +1197,13 @@ class ProcessGroupBaby(ProcessGroup):
             else None
         )
 
-        tx.put(
+        op_id = self._next_op_id
+        self._next_op_id += 1
+
+        pipe.send(
             (
                 "func",
+                op_id,
                 func,
                 _PickleSafeOptions.safe_args(args),
                 kwargs,
@@ -1206,11 +1211,7 @@ class ProcessGroupBaby(ProcessGroup):
                 stream_id,
                 event,
             ),
-            timeout=self._timeout,
         )
-
-        op_id = rx.get(self._timeout)
-        assert isinstance(op_id, int), f"invalid return {op_id}"
 
         return _BabyWork(pg=self, op_id=op_id)
 
@@ -1329,11 +1330,11 @@ class ProcessGroupBaby(ProcessGroup):
         return self._world_size
 
     def num_active_work(self) -> int:
-        assert self._tx is not None
-        self._tx.put(("num_active_work",), timeout=self._timeout)
+        assert self._pipe is not None
+        self._pipe.send(("num_active_work",))
 
-        assert self._rx is not None
-        return cast(int, self._rx.get(self._timeout))
+        assert self._pipe is not None
+        return cast(int, self._pipe.recv(self._timeout))
 
 
 @dataclass
