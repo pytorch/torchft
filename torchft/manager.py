@@ -29,7 +29,6 @@ import concurrent.futures
 import logging
 import os
 import socket
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from enum import Enum
@@ -191,7 +190,7 @@ class Manager:
 
             if replica_id is None:
                 replica_id = ""
-            replica_id = replica_id + str(uuid.uuid4())
+            replica_id = replica_id
             self._manager = ManagerServer(
                 replica_id=replica_id,
                 lighthouse_addr=lighthouse_addr,

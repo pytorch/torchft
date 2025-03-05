@@ -8,6 +8,7 @@ use core::net::SocketAddr;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+
 use std::time::Duration;
 use std::time::{Instant, SystemTime};
 
@@ -61,6 +62,25 @@ pub struct Lighthouse {
     opt: LighthouseOpt,
     listener: Mutex<Option<tokio::net::TcpListener>>,
     local_addr: SocketAddr,
+    change_logger: ChangeLogger,
+}
+
+struct ChangeLogger {
+    last_reason: std::sync::Mutex<Option<String>>,
+}
+impl ChangeLogger {
+    fn new() -> Self {
+        ChangeLogger {
+            last_reason: std::sync::Mutex::new(None),
+        }
+    }
+    fn log_if_changed(&self, reason: &str) {
+        let mut last_reason = self.last_reason.lock().unwrap();
+        if last_reason.as_deref() != Some(reason) {
+            info!("Quorum status: {}", reason);
+            *last_reason = Some(reason.to_string());
+        }
+    }
 }
 
 #[derive(StructOpt, Debug)]
@@ -257,12 +277,13 @@ impl Lighthouse {
             opt: opt,
             local_addr: listener.local_addr()?,
             listener: Mutex::new(Some(listener)),
+            change_logger: ChangeLogger::new(),
         }))
     }
 
     fn _quorum_tick(self: Arc<Self>, state: &mut State) -> Result<()> {
         let (quorum_met, reason) = quorum_compute(Instant::now(), state, &self.opt);
-        info!("Next quorum status: {}", reason);
+        self.change_logger.log_if_changed(&reason);
 
         if quorum_met.is_some() {
             let participants = quorum_met.unwrap();
@@ -448,7 +469,10 @@ impl LighthouseService for Arc<Lighthouse> {
             .requester
             .ok_or_else(|| return Status::invalid_argument("missing requester"))?;
 
-        info!("got quorum request for replica {}", &requester.replica_id);
+        info!(
+            "Received quorum request for replica {}",
+            &requester.replica_id
+        );
 
         let mut rx = {
             let mut state = self.state.lock().await;

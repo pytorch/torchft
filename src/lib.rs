@@ -10,17 +10,21 @@ mod net;
 mod retry;
 mod timeout;
 
+use anyhow::Result;
+use atty::Stream;
 use core::time::Duration;
+use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
 use std::env;
 use std::sync::Arc;
-
-use anyhow::Result;
-use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
 use structopt::StructOpt;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 use tonic::Status;
+
+use chrono::Local;
+use fern::colors::{Color, ColoredLevelConfig};
+use log::LevelFilter;
 
 pub mod torchftpb {
     tonic::include_proto!("torchft");
@@ -397,20 +401,50 @@ impl From<Status> for StatusError {
     }
 }
 
+fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
+    // Check if stderr is a terminal
+    let is_terminal = atty::is(Stream::Stderr);
+    let colors = ColoredLevelConfig::new()
+        .error(Color::Red)
+        .warn(Color::Yellow)
+        .info(Color::Green)
+        .debug(Color::Blue)
+        .trace(Color::Magenta);
+    let level_filter = match env::var("RUST_LOG").as_deref() {
+        Ok("error") => LevelFilter::Error,
+        Ok("warn") => LevelFilter::Warn,
+        Ok("info") => LevelFilter::Info,
+        Ok("debug") => LevelFilter::Debug,
+        Ok("trace") => LevelFilter::Trace,
+        _ => LevelFilter::Info,
+    };
+    fern::Dispatch::new()
+        .format(move |out, message, record| {
+            let module_path = record.module_path().unwrap_or("<unknown>");
+            // If stderr is a terminal, use colors when printing log level, otherwise use plain text
+            let level = if is_terminal {
+                colors.color(record.level()).to_string()
+            } else {
+                record.level().to_string()
+            };
+            out.finish(format_args!(
+                "{} [{}] [{}] - {}",
+                Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
+                level,
+                module_path,
+                message
+            ))
+        })
+        .level(level_filter)
+        .chain(std::io::stderr())
+        .apply()?;
+    Ok(())
+}
+
 #[pymodule]
 fn _torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // setup logging on import
-    let mut log = stderrlog::new();
-    log.verbosity(2)
-        .show_module_names(true)
-        .timestamp(stderrlog::Timestamp::Millisecond);
-
-    if env::var("CLICOLOR_FORCE").is_ok() {
-        log.color(stderrlog::ColorChoice::AlwaysAnsi);
-    }
-
-    log.init()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    setup_logging().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     m.add_class::<ManagerServer>()?;
     m.add_class::<ManagerClient>()?;

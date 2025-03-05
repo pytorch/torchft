@@ -6,12 +6,15 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.89"
 askama = "0.12.1"
+atty = "0.2.14"
 axum = "0.7.7"
+chrono = "0.4.40"
+fern = {version = "0.7.1", features = ["colored"]}
 gethostname = "0.5.0"
 log = "0.4.22"
 prost = "0.13.3"
 prost-types = "0.13.3"
-pyo3 = {version="0.22.3", features = ["extension-module"]}
+pyo3 = {version = "0.22.3", features = ["extension-module"]}
 rand = "0.8.5"
 slog = "2.7.0"
 slog-stdlog = "4.1.1"
