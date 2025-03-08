@@ -981,6 +981,8 @@ class ProcessGroupBaby(ProcessGroup):
         self._pipe = req_local = _MonitoredPipe(req_local)
         self._future_pipe = future_local = _MonitoredPipe(future_local)
 
+        curr_device = torch.cuda.current_device() if torch.cuda.is_available() else -1
+
         self._p = p = ctx.Process(
             target=self._worker,
             args=(
@@ -989,6 +991,7 @@ class ProcessGroupBaby(ProcessGroup):
                 world_size,
                 req_remote,
                 future_remote,
+                curr_device,
             ),
             daemon=True,
         )
@@ -1024,8 +1027,12 @@ class ProcessGroupBaby(ProcessGroup):
         world_size: int,
         req_pipe: "Connection[object, object]",
         future_pipe: "Connection[object, object]",
+        curr_device: int,
     ) -> None:
         try:
+            if curr_device >= 0 and torch.cuda.is_available():
+                torch.cuda.set_device(curr_device)
+
             store = create_store_client(store_addr)
 
             try:

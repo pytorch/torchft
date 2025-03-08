@@ -407,6 +407,7 @@ class Manager:
             allow_heal=allow_heal,
             shrink_only=shrink_only,
             quorum_timeout=timeout or self._quorum_timeout,
+            curr_device=(torch.cuda.current_device() if torch.cuda.is_available() else -1),
         )
         if not self._use_async_quorum:
             self.wait_quorum()
@@ -431,8 +432,10 @@ class Manager:
         self._quorum_future.result()
 
     def _async_quorum(
-        self, allow_heal: bool, shrink_only: bool, quorum_timeout: timedelta
+            self, allow_heal: bool, shrink_only: bool, quorum_timeout: timedelta, curr_device: int,
     ) -> None:
+        if curr_device >= 0 and torch.cuda.is_available():
+            torch.cuda.set_device(curr_device)
         quorum = self._client._quorum(
             rank=self._rank,
             step=self._step,
