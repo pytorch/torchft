@@ -2,24 +2,26 @@ import copy
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack, contextmanager
+import traceback
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Dict, Generator, List, Protocol, Set, Tuple
+from typing import Any, Dict, Generator, List, Optional, Protocol, Set, Tuple, TypeVar
 from unittest import TestCase
 
 import torch
 import torch.distributed as dist
 from parameterized import parameterized
 from torch import nn, optim
+from torch._dynamo.utils import timed
 
 from torchft._torchft import LighthouseServer
 from torchft.ddp import DistributedDataParallel
 from torchft.local_sgd import DiLoCo, LocalSGD
 from torchft.manager import Manager
 from torchft.optim import OptimizerWrapper
-from torchft.process_group import ProcessGroupGloo
+from torchft.process_group import ProcessGroupBabyNCCL, ProcessGroupGloo
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -69,10 +71,14 @@ class FailureInjector:
                 raise InjectedFailure(f"injected failure {rank=} {step=}")
 
 
-class TrainLoop(Protocol):
+# R for an arbitrary return type
+R = TypeVar("R", covariant=True)
+
+
+class TrainLoop(Protocol[R]):
     def __call__(
         self, rank: int, store_port: int, device: torch.device, runner: "Runner"
-    ) -> Dict[str, Dict[str, object]]: ...
+    ) -> R: ...
 
 
 @dataclass
@@ -81,7 +87,7 @@ class Runner:
     num_replicas: int
     lighthouse_address: str
     failure_injector: FailureInjector
-    train_loop: TrainLoop
+    train_loop: TrainLoop[object]
 
     use_cuda: bool = False
     world_size: int = 1
@@ -89,7 +95,7 @@ class Runner:
     manager_args: Dict[str, object] = field(default_factory=dict)
     train_loop_args: Dict[str, Any] = field(default_factory=dict)
 
-    def _replica_main(self) -> List[Dict[str, Dict[str, object]]]:
+    def _replica_main(self) -> List[object]:
         store = dist.TCPStore(
             host_name="localhost",
             port=0,
@@ -131,7 +137,7 @@ class Runner:
 
             return [fut.result() for fut in futures]
 
-    def run_replica(self) -> List[Dict[str, Dict[str, object]]]:
+    def run_replica(self) -> List[object]:
         for i in range(self.attempts):
             try:
                 print(
@@ -391,3 +397,88 @@ class ManagerIntegTest(TestCase):
                     "status: Cancelled, message.*Timeout expired",
                 ):
                     manager.should_commit(timeout=timedelta(seconds=0.01))
+
+    @parameterized.expand(
+        [
+            (True,),
+            # (False,),
+        ]
+    )
+    def test_manager_allreduce(self, use_cuda: bool) -> None:
+        # manager supports allreduce but we found an issue where the future callback is getting called
+        # before the allreduce is complete. This test is to ensure that the callback has stream synchronization
+        lighthouse = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=2,
+        )
+        num_replicas = 2
+        futures = []
+
+        with ThreadPoolExecutor(max_workers=num_replicas) as executor:
+            for replica_id in range(num_replicas):
+                failure_injector = FailureInjector()
+                runner = Runner(
+                    replica_id=replica_id,
+                    num_replicas=num_replicas,
+                    lighthouse_address=lighthouse.address(),
+                    failure_injector=failure_injector,
+                    train_loop=all_reduce_callback,
+                    use_cuda=use_cuda,
+                )
+                futures.append(executor.submit(runner.run_replica))
+
+        results = []
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result()[0])
+            except Exception as e:
+                print(e, flush=True)
+                traceback.print_exc()
+                raise
+
+        lighthouse.shutdown()
+
+        print(results)
+        r0, r1 = results
+        torch.testing.assert_close(r0, r1, check_device=False)
+
+
+def all_reduce_callback(
+    rank: int,
+    store_port: int,
+    device: torch.device,
+    runner: Runner,
+) -> Optional[torch.Tensor]:
+    with ExitStack() as stack:
+        print(f"worker {runner.replica_id=} {rank=} {runner.world_size=} starting")
+
+        if device.type == "cuda":
+            pg = ProcessGroupBabyNCCL()
+        else:
+            pg = ProcessGroupGloo()
+        manager = Manager(
+            pg=pg,
+            min_replica_size=2,
+            use_async_quorum=False,
+            load_state_dict=lambda x: None,
+            state_dict=lambda: None,
+            replica_id=str(runner.replica_id),
+            store_addr="localhost",
+            store_port=store_port,
+            rank=rank,
+            world_size=runner.world_size,
+            lighthouse_addr=runner.lighthouse_address,
+            port=19530 + runner.replica_id,
+            timeout=timedelta(seconds=10),
+            quorum_timeout=timedelta(seconds=10),
+            # pyre-fixme[6]: Incompatible parameter type
+            **runner.manager_args,
+        )
+        stack.callback(lambda: manager.shutdown(wait=False))
+
+        manager.start_quorum()
+        t1 = torch.ones((1, 2), device=device)
+        fut = manager.allreduce(t1)
+        fut.wait()
+        return t1
+    return None
