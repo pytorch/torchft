@@ -1045,6 +1045,7 @@ class ProcessGroupBaby(ProcessGroup):
 
             streams: Dict[str, torch.cuda.Stream] = {}
             work: Dict[int, _OpMetadata] = {}
+            future_event: Dict[int, Optional[torch.cuda.Event]] = {}
 
             while True:
                 op = cast(list[object], req_pipe.recv())
@@ -1093,10 +1094,22 @@ class ProcessGroupBaby(ProcessGroup):
 
                         args = _PickleSafeOptions.unsafe_args(args)
                         fn = getattr(pg, func_name)
+                        # create an event after the collective has been issued
+                        # to wait on this before we call "future"
+                        after_coll_event = (
+                            torch.cuda.current_stream().record_event(
+                                torch.cuda.Event(interprocess=True)
+                            )
+                            if stream is not None
+                            else None
+                        )
+                        future_event[op_id] = after_coll_event
+
                         work[op_id] = _OpMetadata(
                             work=fn(*args, **kwargs),
                             stream=stream,
                         )
+
                 elif cmd == "wait":
                     op_id, timeout = cast(tuple[int, timedelta], op[1:])
 
@@ -1126,6 +1139,7 @@ class ProcessGroupBaby(ProcessGroup):
                     del work[op_id]
                 elif cmd == "future":
                     op_id: int = cast(int, op[1])
+                    metadata = work[op_id]
 
                     def callback(fut: Future[object]) -> None:
                         try:
@@ -1134,7 +1148,13 @@ class ProcessGroupBaby(ProcessGroup):
                         except Exception as e:
                             future_pipe.send((op_id, _FUTURE_EXCEPTION, e))
 
-                    work[op_id].work.get_future().add_done_callback(callback)
+                    # The event created after "wait" to ensure the collective is done
+                    # TODO: is this the best place to put this??....
+                    event = future_event[op_id]
+                    if event is not None:
+                        event.wait()
+                    del future_event[op_id]
+                    metadata.work.get_future().add_done_callback(callback)
                 elif cmd == "num_active_work":
                     req_pipe.send(len(work))
                 else:
