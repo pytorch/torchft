@@ -9,6 +9,7 @@ from unittest import TestCase
 from unittest.mock import create_autospec
 
 import torch
+from parameterized import parameterized
 from torch import nn, optim
 
 from torchft.local_sgd import DiLoCo, LocalSGD
@@ -129,3 +130,49 @@ class DiLoCoTest(TestCase):
 
             outer_opt_state = outer_optimizer.state_dict()
             self.assertEqual(len(outer_opt_state["state"]), parameter_count)
+
+    @parameterized.expand(
+        [
+            (
+                "without_bucketization",
+                False,
+                lambda self, manager, model: self.assertEqual(
+                    manager.allreduce.call_count, len(list(model.parameters()))
+                ),
+            ),
+            (
+                "with_bucketization",
+                True,
+                lambda self, manager, model: self.assertGreaterEqual(
+                    manager.allreduce.call_count, 1
+                ),
+            ),
+        ]
+    )
+    def test_diloco_all_reduce(self, name, use_bucketization, assert_func):
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(
+            model.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
+        )
+        outer_optimizer = optim.SGD(
+            model.parameters(), lr=0.7, momentum=0.9, nesterov=True
+        )
+
+        manager = create_autospec(Manager)
+        manager._use_async_quorum = False
+
+        with DiLoCo(
+            manager,
+            model,
+            inner_optimizer,
+            outer_optimizer,
+            sync_every=2,
+            use_bucketization=use_bucketization,
+        ) as diloco:
+            inp = torch.rand(2, 3)
+            loss = model(inp).mean()
+            loss.backward()
+            inner_optimizer.step()
+
+            self.assertEqual(diloco._local_step, 1)
+            assert_func(self, manager, model)
