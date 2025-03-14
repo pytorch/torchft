@@ -25,6 +25,7 @@ tonic = "0.12.2"
 
 [build-dependencies]
 tonic-build = "0.12.2"
+cmake = "0.1"
 
 [lib]
 name = "torchft"

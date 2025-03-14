@@ -23,35 +23,34 @@ from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing.connection import Connection
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
+    cast,
     Dict,
     Generator,
     List,
     Optional,
     Tuple,
+    TYPE_CHECKING,
     TypeVar,
     Union,
-    cast,
 )
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch._C._distributed_c10d import PrefixStore
 
 # pyre-fixme[21]: no attribute ProcessGroupNCCL
 # pyre-fixme[21]: no attribute ProcessGroupGloo
 from torch.distributed import (
     DeviceMesh,
-    PrefixStore,
-    ProcessGroup as BaseProcessGroup,
-    ProcessGroupGloo as BaseProcessGroupGloo,
-    ProcessGroupNCCL as BaseProcessGroupNCCL,
-    Store,
-    TCPStore,
     get_rank,
     init_device_mesh,
+    ProcessGroup as BaseProcessGroup,
+    ProcessGroupGloo as BaseProcessGroupGloo,
+    Store,
+    TCPStore,
 )
 from torch.distributed.distributed_c10d import (
     AllgatherOptions,
@@ -67,6 +66,7 @@ from torch.distributed.distributed_c10d import (
 from torch.futures import Future
 from torch.utils._pytree import tree_any
 
+from torchft._torchft_cpp import ProcessGroupNCCL as BaseProcessGroupNCCL
 from torchft.multiprocessing import _MonitoredPipe
 
 if TYPE_CHECKING:
