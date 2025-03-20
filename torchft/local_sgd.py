@@ -13,6 +13,7 @@ from types import TracebackType
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type
 
 import torch
+import torch.distributed as dist
 from torch import nn, optim
 from torch.nn.parameter import Parameter
 from torch.optim.optimizer import Optimizer
@@ -153,6 +154,9 @@ class DiLoCo:
     diloco: https://arxiv.org/pdf/2311.08105
     """
 
+    bucket_cap_mb = 32 * 1024 * 1024
+    use_bucketization = False
+
     def __init__(
         self,
         manager: Manager,
@@ -162,6 +166,8 @@ class DiLoCo:
         sync_every: int,
         backup_device: Optional[torch.device] = None,
         pin_memory: bool = True,
+        use_bucketization: bool = False,
+        bucket_cap_mb: int = None,
     ) -> None:
         if manager._use_async_quorum:
             raise ValueError(
@@ -180,6 +186,12 @@ class DiLoCo:
 
         self._hooks: List[RemovableHandle] = []
         self._outer_optimizer = outer_optimizer
+
+        if bucket_cap_mb is not None:
+            self.bucket_cap_mb = int(bucket_cap_mb * 1024 * 1024)
+
+        self.use_bucketization = use_bucketization
+        
         self.original_parameters: Dict[str, torch.Tensor] = {}
         for name, p in self._model.named_parameters():
             t = torch.empty(*tuple(p.shape), dtype=p.dtype, device=self._backup_device)
@@ -266,14 +278,64 @@ class DiLoCo:
 
     def _average_grads(self) -> None:
         """
-        Average the gradients across the diloco group.
+        Efficiently averages gradients across the group using either:
+        - Per-parameter allreduce (old behavior)
+        - Bucketized allreduce (new behavior)
         """
+        if self.use_bucketization:
+            self._allreduce_bucketized()
+        else:
+            self._allreduce_per_param()
+
+    def _allreduce_per_param(self) -> None:
+        """Performs allreduce on each gradient tensor separately (original method)."""
         works = []
         for p in self._model.parameters():
-            # Perform allreduce on the pseudogradients
-            assert p.grad is not None
+            if p.grad is None:
+                continue
             work = self._manager.allreduce(p.grad)
             works.append(work)
-        # Wait for all allreduce operations to complete
+
         for work in works:
             work.wait()
+
+    def _allreduce_bucketized(self) -> None:
+        """
+        Averages gradients using bucketized allreduce with a fixed 32MB buffer.
+        """
+
+        grads = [p.grad for p in self._model.parameters() if p.grad is not None]
+        if not grads:
+            return
+
+        # Compute total size and allocate a flat buffer
+        total_size = sum(g.numel() for g in grads)
+        dtype, device = grads[0].dtype, grads[0].device
+
+        # Process in fixed 32MB chunks
+        offset = 0
+        while offset < total_size:
+            # Compute chunk size
+            chunk_size = min(
+                self.BUCKET_SIZE_BYTES // grads[0].element_size(), total_size - offset
+            )
+
+            flat_buffer = torch.zeros(chunk_size, dtype=dtype, device=device)
+
+            # Pack gradients into buffer
+            pack_offset, bucket_tensors = 0, []
+            for g in grads:
+                numel = g.numel()
+                if pack_offset + numel > chunk_size:
+                    break
+                flat_buffer[pack_offset : pack_offset + numel].copy_(g.view(-1))
+                bucket_tensors.append((g, pack_offset, numel))
+                pack_offset += numel
+
+            work = self._manager.allreduce(flat_buffer)
+            work.wait()
+
+            for g, pack_offset, numel in bucket_tensors:
+                g.copy_(flat_buffer[pack_offset : pack_offset + numel].view_as(g))
+
+            offset += chunk_size  # Move to next chunk
