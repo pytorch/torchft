@@ -445,6 +445,8 @@ class Manager:
         quorum_timeout: timedelta,
         curr_device: int,
     ) -> None:
+        torch.multiprocessing._set_thread_name("torchft_quorum")
+
         if curr_device >= 0 and torch.cuda.is_available():
             torch.cuda.set_device(curr_device)
         quorum = self._client._quorum(
@@ -604,6 +606,9 @@ class Manager:
             self._recovery_stream.synchronize()
 
         self._pending_work = []
+
+        if err := self._pg.errored():
+            self.report_error(err)
 
         # apply state_dict if healing
         if self._healing:

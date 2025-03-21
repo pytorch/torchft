@@ -344,6 +344,12 @@ class ProcessGroup(BaseProcessGroup):
         """
         pass
 
+    def errored(self) -> Optional[Exception]:
+        """
+        Whether an async error occured that requires reconfiguration.
+        """
+        return None
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"
 
@@ -657,6 +663,8 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         super().__init__(timeout)
         self._use_abort: bool = torch.cuda.nccl.version() >= (2, 25)
 
+        self._errored: Optional[Exception] = None
+
     def _opts_hook(self, opts: T) -> T:
         if not self._use_abort:
             return opts
@@ -679,6 +687,8 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         return _WorkCUDATimeout(self, work, timeout)
 
     def _create_pg(self, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
+        self._errored = None
+
         pg = BaseProcessGroup(store, rank, world_size)
         pg._set_default_backend(ProcessGroup.BackendType.NCCL)
         # pyre-fixme[16]: no attribute ProcessGroupNCCL
@@ -688,6 +698,18 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
             torch.device("cuda"), ProcessGroup.BackendType.NCCL, backend_class
         )
         return pg
+
+    def abort(self) -> None:
+        super().abort()
+
+        self._errored = RuntimeError("aborted")
+
+    def errored(self) -> Optional[Exception]:
+        pg = self._pg
+        if pg is not None:
+            pg._wait_for_pending_works()
+
+        return self._errored
 
     def getBackendName(self) -> str:
         return "torchft-nccl"

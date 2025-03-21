@@ -921,6 +921,8 @@ class MultiPgBaseTest(TestCase):
         def worker(pg: ProcessGroup, rank: int, dev: str) -> str:
             if dev == "cuda":
                 torch.cuda.set_device(rank)
+                # Use a separate stream to avoid deadlocks between threads.
+                torch.cuda.set_stream(torch.cuda.Stream())
 
             fault_rank = self.WORLD_SIZE - 1
             test = _COLLECTIVE_TO_FUNC[collective]
@@ -951,6 +953,10 @@ class MultiPgBaseTest(TestCase):
             ):
                 test(pg, rank, t1.clone())
                 raise RuntimeError("no error")
+
+            if err := pg.errored():
+                with self.assertRaisesRegex(RuntimeError, "aborted"):
+                    raise err
 
             return f"Rank{rank} final success."
 

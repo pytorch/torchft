@@ -42,6 +42,8 @@ class TestManager(TestCase):
         timeout: timedelta = timedelta(seconds=10),
     ) -> Manager:
         pg = create_autospec(ProcessGroup)
+        pg.errored.return_value = None
+
         self.store = TCPStore(
             host_name="localhost", port=0, is_master=True, wait_for_workers=False
         )
@@ -407,6 +409,39 @@ class TestManager(TestCase):
         manager.start_quorum()
         manager.allreduce(torch.tensor([1.0])).wait()
         self.assertTrue(manager.should_commit())
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_pg_errored(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager()
+        client_mock().should_commit = mock_should_commit
+
+        quorum = QuorumResult()
+        quorum.quorum_id = 123
+        quorum.replica_rank = 1
+        quorum.replica_world_size = 2
+        quorum.recover_src_manager_address = "manager address"
+        quorum.store_address = f"localhost:{self.store.port}"
+        quorum.max_step = 1
+        quorum.max_rank = 1
+        quorum.max_world_size = 2
+        quorum.heal = False
+
+        client_mock()._quorum.return_value = quorum
+
+        self.assertEqual(manager._quorum_id, -1)
+        self.assertEqual(manager.current_step(), 0)
+
+        manager.start_quorum()
+
+        injected_failure = RuntimeError("injected failure")
+
+        # pyre-ignore[16]: _pg is mocked
+        manager._pg.errored.return_value = injected_failure
+
+        self.assertFalse(manager.should_commit())
+        self.assertEqual(manager._errored, injected_failure)
+        # pyre-ignore[16]: _pg is mocked
+        self.assertEqual(manager._pg.errored.call_count, 1)
 
     @patch("torchft.manager.ManagerClient", autospec=True)
     def test_quorum_fixed_world_size(self, client_mock: MagicMock) -> None:
