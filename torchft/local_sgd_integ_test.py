@@ -2,7 +2,7 @@ import copy
 import logging
 import re
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed, ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import timedelta
 from typing import Any, Dict
@@ -16,7 +16,11 @@ from torchft._torchft import LighthouseServer
 from torchft.local_sgd import DiLoCo, LocalSGD
 from torchft.manager import Manager
 from torchft.manager_integ_test import FailureInjector, MyModel, Runner
-from torchft.process_group import ProcessGroupBabyNCCL, ProcessGroupGloo
+from torchft.process_group import (
+    ProcessGroupBabyNCCL,
+    ProcessGroupGloo,
+    ProcessGroupNCCL,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -42,7 +46,7 @@ def local_sgd_train_loop(
         print(f"worker {runner.replica_id=} {rank=} {runner.world_size=} starting")
 
         if device.type == "cuda":
-            pg = ProcessGroupBabyNCCL()
+            pg = ProcessGroupNCCL()
         else:
             pg = ProcessGroupGloo()
         manager = Manager(
@@ -133,7 +137,8 @@ def diloco_train_loop(
         print(f"worker {runner.replica_id=} {rank=} {runner.world_size=} starting")
 
         if device.type == "cuda":
-            pg = ProcessGroupBabyNCCL()
+            pg = ProcessGroupNCCL()
+            # pg = ProcessGroupBabyNCCL()
         else:
             pg = ProcessGroupGloo()
         manager = Manager(

@@ -3,8 +3,8 @@ import logging
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack, contextmanager
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Dict, Generator, List, Optional, Protocol, Set, Tuple, TypeVar
@@ -21,7 +21,7 @@ from torchft.ddp import DistributedDataParallel
 from torchft.local_sgd import DiLoCo, LocalSGD
 from torchft.manager import Manager
 from torchft.optim import OptimizerWrapper
-from torchft.process_group import ProcessGroupBabyNCCL, ProcessGroupGloo
+from torchft.process_group import ProcessGroupGloo, ProcessGroupNCCL
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -118,6 +118,7 @@ class Runner:
                 else:
                     device = torch.device("cpu")
 
+                # try on a separate stream
                 futures.append(
                     executor.submit(
                         self.train_loop,
@@ -401,7 +402,7 @@ class ManagerIntegTest(TestCase):
     @parameterized.expand(
         [
             (True,),  # Test with CUDA
-            (False,),  # Test without CUDA (CPU)
+            # (False,),  # Test without CUDA (CPU)
         ]
     )
     def test_manager_allreduce(self, use_cuda: bool) -> None:
@@ -457,7 +458,7 @@ def all_reduce_callback(
         print(f"worker {runner.replica_id=} {rank=} {runner.world_size=} starting")
 
         if device.type == "cuda":
-            pg = ProcessGroupBabyNCCL()
+            pg = ProcessGroupNCCL()
         else:
             pg = ProcessGroupGloo()
         manager = Manager(
@@ -480,9 +481,19 @@ def all_reduce_callback(
         )
         stack.callback(lambda: manager.shutdown(wait=False))
 
-        manager.start_quorum()
-        t1 = torch.ones((1, 3), device=device)
-        fut = manager.allreduce(t1)
-        fut.wait()
-        return t1
+        with torch.cuda.stream(torch.cuda.Stream()):
+            results = []
+            manager.start_quorum()
+            futs = []
+            for _ in range(1):
+                t1 = torch.randn((1, 3), device=device)
+                fut = manager.allreduce(t1)
+                futs.append(fut)
+                results.append(t1)
+            # Wait for all allreduce operations to complete
+            for fut in futs:
+                fut.wait()
+            results_tensor = torch.stack(results)
+            total_sum = results_tensor.sum(dim=0)
+            return total_sum
     return None

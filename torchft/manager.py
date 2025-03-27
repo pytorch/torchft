@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
+from typing import Callable, cast, Dict, List, Optional, TYPE_CHECKING, TypeVar
 
 import torch
 from torch.distributed import ReduceOp, TCPStore
@@ -186,6 +186,7 @@ class Manager:
         self._recovery_stream: Optional["torch.cuda.Stream"] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
+        self._replica_id = replica_id
 
         if rank == 0:
             if port is None:
@@ -272,6 +273,7 @@ class Manager:
             fut.set_result(tensor)
             return fut
 
+        print(f"{self._replica_id} in allreduce")
         self.wait_quorum()
 
         if not self.is_participating():
@@ -283,17 +285,41 @@ class Manager:
             # it later.
             work = self._pg.allreduce([tensor], ReduceOp.SUM)
             fut = work.get_future()
+            # torch.cuda.synchronize()
+
+            event = torch.cuda.Event()
+
+            # def record_event_callback(
+            #     fut: torch.futures.Future[List[torch.Tensor]],
+            # ) -> None:
+            #     # We need to record the event after the allreduce completes
+            #     # which is why this is its own callback
+            #     event.record()
+
+            # fut = fut.then(record_event_callback)
 
             # schedule grad normalization as a continuation
             # on the Future
             def callback(
                 fut: torch.futures.Future[List[torch.Tensor]],
             ) -> torch.Tensor:
-                nonlocal tensor
+                # work.wait()
+                print(f"{torch.cuda.current_stream()=}")
+                # torch.cuda.synchronize()
+                # event.record()
+                # event.synchronize()
 
                 # check for exceptions
-                fut.value()
+                value = fut.value()
+                # print(value)
+                # val_tensor = value[0]
 
+                # if val_tensor is None:
+                #     # edge case for process group baby nccl
+                #     nonlocal tensor
+                # else:
+                #     tensor = val_tensor
+                nonlocal tensor
                 tensor /= self.num_participants()
 
                 return tensor
@@ -436,7 +462,9 @@ class Manager:
         assert (
             self._quorum_future is not None
         ), "must call start_quorum before wait_quorum"
-        self._quorum_future.result()
+        print(f"{self._replica_id} Called wait_quorum()")
+        result = self._quorum_future.result()
+        print(f"{self._replica_id} Finished wait_quorum() {result=}")
 
     def _async_quorum(
         self,
@@ -726,6 +754,7 @@ class Manager:
         self.wait_quorum()
 
         assert self._participating_world_size >= 0, "internal error"
+        print(f"{self._replica_id} returning {self._participating_world_size}")
         return self._participating_world_size
 
     def is_participating(self) -> bool:
