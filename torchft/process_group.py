@@ -23,17 +23,17 @@ from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing.connection import Connection
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
+    cast,
     Dict,
     Generator,
     List,
     Optional,
     Tuple,
+    TYPE_CHECKING,
     TypeVar,
     Union,
-    cast,
 )
 
 import torch
@@ -44,14 +44,14 @@ import torch.multiprocessing as mp
 # pyre-fixme[21]: no attribute ProcessGroupGloo
 from torch.distributed import (
     DeviceMesh,
+    get_rank,
+    init_device_mesh,
     PrefixStore,
     ProcessGroup as BaseProcessGroup,
     ProcessGroupGloo as BaseProcessGroupGloo,
     ProcessGroupNCCL as BaseProcessGroupNCCL,
     Store,
     TCPStore,
-    get_rank,
-    init_device_mesh,
 )
 from torch.distributed.distributed_c10d import (
     AllgatherOptions,

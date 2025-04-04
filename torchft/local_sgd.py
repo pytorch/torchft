@@ -255,7 +255,15 @@ class DiLoCo:
             pseudogradient = p.data - self.original_parameters[name]
             p.grad = pseudogradient
 
+        for name, p in self._model.named_parameters():
+            print(
+                f"BEFORE average, replica {self._manager._replica_id} [{name} {p.data=} {self.original_parameters[name]=} {p.grad}]"
+            )
         self._average_grads()
+        for name, p in self._model.named_parameters():
+            print(
+                f"AFTER average, replica {self._manager._replica_id} [{name} {p.grad}]"
+            )
         # Restore the parameters back to the previous state
         self._restore_parameters()
         if self._manager.should_commit():
@@ -272,7 +280,7 @@ class DiLoCo:
         for p in self._model.parameters():
             # Perform allreduce on the pseudogradients
             assert p.grad is not None
-            work = self._manager.allreduce(p.grad)
+            work = self._manager.allreduce(p.grad.data)
             works.append(work)
         # Wait for all allreduce operations to complete
         for work in works:
