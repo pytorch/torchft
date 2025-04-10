@@ -290,7 +290,6 @@ class PGTransport(CheckpointTransport[T]):
                 values.append(recv(path, v))
             elif isinstance(v, _DTensorMeta):
                 tensor = recv(path, v.local)
-                # pyre-fixme[29]: DTensor is not a function
                 values.append(DTensor(tensor, v.spec, requires_grad=False))
             else:
                 values.append(v)

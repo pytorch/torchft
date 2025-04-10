@@ -36,13 +36,13 @@ class OptimizerWrapper(Optimizer):
         self.optim = optim
         self.manager = manager
 
-    def add_param_group(self, param_group: object) -> None:
+    def add_param_group(self, param_group: Dict[str, Any]) -> None:
         self.optim.add_param_group(param_group)
 
-    def load_state_dict(self, state_dict: object) -> None:
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         self.optim.load_state_dict(state_dict)
 
-    def state_dict(self) -> object:
+    def state_dict(self) -> Dict[str, Any]:
         return self.optim.state_dict()
 
     def zero_grad(self, set_to_none: bool = True) -> None:

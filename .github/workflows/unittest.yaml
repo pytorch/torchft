@@ -15,11 +15,11 @@ jobs:
           - runs-on: "linux.2xlarge"
             gpu-arch-type: "cpu"
             gpu-arch-version: ""
-            torch-version: "stable"
+            torch-version: "test"
           - runs-on: "linux.g5.12xlarge.nvidia.gpu"
             gpu-arch-type: "cuda"
             gpu-arch-version: "12.4"
-            torch-version: "stable"
+            torch-version: "test"
           - runs-on: "linux.g5.12xlarge.nvidia.gpu"
             gpu-arch-type: "cuda"
             gpu-arch-version: "12.4"
@@ -46,6 +46,9 @@ jobs:
         # Optionally install torch nightly, pulls latest CUDA from pip otherwise
         if [ "${{ matrix.torch-version }}" = "nightly" ]; then
           pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+        fi
+        if [ "${{ matrix.torch-version }}" = "test" ]; then
+          pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         fi
 
         # Install dependencies
