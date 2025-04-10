@@ -26,7 +26,7 @@ def _fallback_load(f: IO[bytes], weights_only: bool = True) -> object:
 
 
 try:
-    # pyre-fixme[21]: upgrade to PT 2.7 once released
+    # upgrade to PT 2.7 once released
     from torch.distributed._serialization import _streaming_load, _streaming_save
 except ImportError:
     _streaming_load = _fallback_load

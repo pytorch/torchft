@@ -122,6 +122,7 @@ Before proceeding, ensure you have the following installed:
 
 - Rust (with necessary dependencies)
 - `protobuf-compiler` and the corresponding development package for Protobuf.
+- PyTorch 2.7 RC+ or Nightly
 
 Note that the Rust versions available in many conda environments may be outdated. To install the latest version of Rust, we recommend downloading it directly from the official website as shown in the below command:
 ```sh

@@ -387,7 +387,6 @@ class ProcessGroupWrapper(ProcessGroup):
         pg = self._pg
         if pg is not None:
             if hasattr(pg, "abort"):
-                # pyre-fixme[16]: has no attribute abort
                 pg.abort()
             else:
                 try:
@@ -395,7 +394,6 @@ class ProcessGroupWrapper(ProcessGroup):
                 except RuntimeError:
                     backend = None
                 if backend is not None and hasattr(backend, "abort"):
-                    # pyre-fixme[16]: no attribute abort
                     backend.abort()
 
             self._pg = None
