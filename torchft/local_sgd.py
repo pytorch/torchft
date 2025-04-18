@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type
 
 import torch
 from torch import nn, optim
+from torch.distributed.tensor import DTensor
 from torch.nn.parameter import Parameter
 from torch.optim.optimizer import Optimizer
 from torch.utils.hooks import RemovableHandle
@@ -21,6 +22,20 @@ from torch.utils.hooks import RemovableHandle
 from torchft.manager import Manager
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a cloned version of the input tensor. If the input tensor is a DTensor,
+    it extracts and clones its local representation.
+    """
+    new_tensor = None
+    if isinstance(t, DTensor):
+        new_tensor = t.to_local().clone()
+    else:
+        new_tensor = t.clone()
+    new_tensor.grad = None
+    return new_tensor
 
 
 class LocalSGD:
@@ -126,7 +141,15 @@ class LocalSGD:
         if self._manager.should_commit():
             # Update the model parameters with the averaged values
             for param, avg_param in zip(self._model.parameters(), averaged_parameters):
-                param.data.copy_(avg_param)
+                if isinstance(param, DTensor):
+                    # we averaged the local version of the tensor so need to copy it back as a DTensor
+                    param.data.copy_(
+                        DTensor.from_local(
+                            avg_param, param.device_mesh, param.placements
+                        )
+                    )
+                else:
+                    param.data.copy_(avg_param)
 
     def _average(self) -> list[torch.Tensor]:
         """
@@ -136,8 +159,7 @@ class LocalSGD:
         averaged_parameters = []
         for p in self._model.parameters():
             # Create a new tensor to store the averaged parameter
-            p.data.grad = None
-            avg_param = p.data.clone()
+            avg_param = extract_local_tensor(p)
             works.append(self._manager.allreduce(avg_param))
             averaged_parameters.append(avg_param)
         for work in works:
@@ -182,6 +204,8 @@ class DiLoCo:
         self._outer_optimizer = outer_optimizer
         self.original_parameters: Dict[str, torch.Tensor] = {}
         for name, p in self._model.named_parameters():
+            if isinstance(p, DTensor):
+                p = extract_local_tensor(p.data)
             t = torch.empty(*tuple(p.shape), dtype=p.dtype, device=self._backup_device)
             if (
                 self._pin_memory
@@ -198,13 +222,23 @@ class DiLoCo:
         with torch.no_grad():
             # TODO: consider running copy on a separate stream
             for name, p in self._model.named_parameters():
-                self.original_parameters[name].copy_(p.data, non_blocking=True)
+                param_to_local = extract_local_tensor(p.data)
+                self.original_parameters[name].copy_(param_to_local, non_blocking=True)
 
     def _restore_parameters(self) -> None:
         with torch.no_grad():
             # TODO: consider running copy on a separate stream
             for name, p in self._model.named_parameters():
-                p.data.copy_(self.original_parameters[name], non_blocking=False)
+                if isinstance(p, DTensor):
+                    # we averaged the local version of the tensor so need to copy it back as a DTensor
+                    p.data.copy_(
+                        DTensor.from_local(
+                            self.original_parameters[name], p.device_mesh, p.placements
+                        ),
+                        non_blocking=False,
+                    )
+                else:
+                    p.data.copy_(self.original_parameters[name], non_blocking=False)
 
     def __enter__(self) -> "DiLoCo":
         # Add optimizer hook which increments the local step counter and syncs if necessary
@@ -252,8 +286,13 @@ class DiLoCo:
         """
         # Set the .grad field of each parameter to its pseudogradient
         for name, p in self._model.named_parameters():
-            pseudogradient = p.data - self.original_parameters[name]
-            p.grad = pseudogradient
+            local_param = extract_local_tensor(p.data)
+            pseudogradient = local_param - self.original_parameters[name]
+            # TODO: is there something else available other than _local_tensor?
+            if isinstance(p, DTensor):
+                p._local_tensor.grad = pseudogradient
+            else:
+                p.grad = pseudogradient
 
         self._average_grads()
         # Restore the parameters back to the previous state

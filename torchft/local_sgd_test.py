@@ -6,12 +6,13 @@
 
 from typing import Dict
 from unittest import TestCase
-from unittest.mock import create_autospec
+from unittest.mock import MagicMock, create_autospec
 
 import torch
 from torch import nn, optim
+from torch.distributed.tensor import DTensor
 
-from torchft.local_sgd import DiLoCo, LocalSGD
+from torchft.local_sgd import DiLoCo, LocalSGD, extract_local_tensor
 from torchft.manager import Manager
 
 
@@ -61,6 +62,23 @@ class LocalSGDTest(TestCase):
             self.assertEqual(local_sgd._local_step, 0)
             self.assertEqual(manager.should_commit.call_count, 1)
             self.assertEqual(manager.allreduce.call_count, 4)
+
+    def test_extract_local_tensor(self) -> None:
+        regular_tensor = torch.rand(3, 3, requires_grad=True)
+        regular_result = extract_local_tensor(regular_tensor)
+
+        self.assertTrue(torch.equal(regular_result, regular_tensor))
+        self.assertIsNone(regular_result.grad)
+        self.assertNotEqual(id(regular_result), id(regular_tensor))
+        local_tensor = torch.rand(3, 3, requires_grad=True)
+        dtensor = MagicMock(spec=DTensor)
+        dtensor.to_local.return_value = local_tensor
+        dtensor_result = extract_local_tensor(dtensor)
+
+        self.assertTrue(torch.equal(dtensor_result, local_tensor))
+        self.assertIsNone(dtensor_result.grad)
+        self.assertNotEqual(id(dtensor_result), id(local_tensor))
+        dtensor.to_local.assert_called_once()
 
     def test_local_sgd_recovery(self) -> None:
         model = SimpleModel()
