@@ -83,7 +83,7 @@ impl ChangeLogger {
     }
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt, Debug, Clone)]
 #[structopt()]
 pub struct LighthouseOpt {
     // bind is the address to bind the server to.
