@@ -1026,10 +1026,11 @@ class _ManagedWork(Work):
 
     def wait(self, timeout: Optional[timedelta] = None) -> bool:
         try:
-            if timeout is not None:
-                self._work.wait(timeout)
-            else:
-                self._work.wait()
+            if self._work is not None:
+                if timeout is not None:
+                    self._work.wait(timeout)
+                else:
+                    self._work.wait()
         except Exception as e:
             self._manager.report_error(e)
 
@@ -1064,7 +1065,6 @@ class ManagedProcessGroup(ProcessGroupWrapper):
 
         if self._manager.errored() is not None:
             return _DummyWork(tensors)
-
         try:
             work = super().allreduce(tensors, opts)
         except Exception as e:
