@@ -46,7 +46,7 @@ class DistributedSampler(data.distributed.DistributedSampler):
     def __init__(
         self,
         dataset: data.Dataset,
-        replica_rank: int,
+        replica_group_id: int,
         num_replica_groups: int,
         group_rank: Optional[int] = None,
         num_replicas: Optional[int] = None,
@@ -65,7 +65,7 @@ class DistributedSampler(data.distributed.DistributedSampler):
         if num_replicas is None:
             num_replicas = dist.get_world_size()
 
-        self.global_rank: int = group_rank + num_replicas * replica_rank
+        self.global_rank: int = group_rank + num_replicas * replica_group_id
         self.global_world_size: int = num_replicas * num_replica_groups
 
         super().__init__(
