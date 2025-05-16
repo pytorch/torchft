@@ -1,0 +1,12 @@
+use tonic::{Request, Status, service::Interceptor};
+use tonic::metadata::MetadataValue;
+
+pub fn room_id_interceptor(room: String) -> impl Interceptor {
+    move |mut req: Request<()>| {
+        req.metadata_mut().insert(
+            crate::router::ROOM_ID_HEADER,
+            MetadataValue::try_from(room.as_str()).expect("ascii header"),
+        );
+        Ok(req) // returning Err(Status) would cancel the call :contentReference[oaicite:0]{index=0}
+    }
+}
