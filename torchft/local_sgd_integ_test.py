@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,8 +12,10 @@ from unittest import TestCase
 import torch
 from parameterized import parameterized
 from torch import nn, optim
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchft._torchft import LighthouseServer
+from torchft.device_mesh import ft_init_device_mesh
 from torchft.local_sgd import DiLoCo, LocalSGD
 from torchft.manager import Manager
 from torchft.manager_integ_test import FailureInjector, MyModel, Runner
@@ -64,6 +67,29 @@ def local_sgd_train_loop(
         stack.callback(lambda: manager.shutdown(wait=False))
 
         m: nn.Module = MyModel().to(device)
+
+        # # Apply FSDP
+        # mesh = init_device_mesh("cuda", (runner.world_size,), mesh_dim_names=("dp",))
+        # for module in m.modules():
+        #     if isinstance(module, nn.Linear):
+        #         fully_shard(module, mesh=mesh)
+        # fully_shard(m, mesh=mesh)
+
+        # LOCALSGD
+        print(f"worker {runner.replica_id=} {rank=} {runner.world_size=} starting")
+
+        import fbvscode
+
+        device_type = device.type
+        ft_device_mesh = ft_init_device_mesh(
+            device_type=device_type,
+            mesh_shape=(1,),
+            mesh_dim_names=("none",),
+            replicate_dim=runner.world_size,
+            manager=manager,
+        )
+        print(f"{ft_device_mesh=}")
+
         optimizer: optim.Optimizer = optim.Adam(m.parameters())
         criterion = nn.CrossEntropyLoss()
 
@@ -156,6 +182,27 @@ def diloco_train_loop(
             **runner.manager_args,
         )
         stack.callback(manager.shutdown)
+        # initialize default group for device mesh
+        if torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                init_method=f"tcp://localhost:0", rank=rank, world_size=runner.world_size
+            )
+
+        device_type = device.type
+        ft_device_mesh = ft_init_device_mesh(
+            device_type=device_type,
+            mesh_shape=(runner.world_size, 1),
+            mesh_dim_names=("replicate", "none"),
+            replicate_dim=0,
+            manager=manager,
+        )
+        for layer in m.layers:
+            if isinstance(layer, nn.Linear):
+                for param in layer.parameters():
+                    param = DTensor.from_local(
+                        param,
+                        device_mesh=ft_device_mesh,
+                    )
 
         criterion = nn.CrossEntropyLoss()
         all_state_dicts = {}
@@ -170,15 +217,16 @@ def diloco_train_loop(
             while True:
                 manager_curr_step = manager.current_step()
                 if manager_curr_step not in all_state_dicts:
-                    print(
-                        f"{manager_curr_step=} {diloco._local_step=} {runner.replica_id=} {state_dict()=}"
-                    )
+                    # print(
+                    #     f"{manager_curr_step=} {diloco._local_step=} {runner.replica_id=} {state_dict()=}"
+                    # )
                     all_state_dicts[manager_curr_step] = copy.deepcopy(state_dict())
                 batch_size = 1
-                inputs = m.get_rand_inputs(batch_size).to(device)
-                labels = m.get_rand_labels(batch_size).to(device)
+                inputs = m.get_rand_inputs(batch_size, device=device)
+                labels = m.get_rand_labels(batch_size, device=device)
 
                 out = m(inputs)
+                # print(f"{device=} {inputs=} {out=} {labels=}]")
                 loss = criterion(out, labels)
 
                 inner_optimizer.zero_grad()
@@ -261,7 +309,7 @@ class LocalSGDIntegTest(TestCase):
 
     @parameterized.expand(
         [
-            # (True,),
+            (True,),
             (False,),
         ]
     )

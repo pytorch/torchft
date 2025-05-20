@@ -33,19 +33,29 @@ class MyModel(nn.Module):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.model = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.Sigmoid(),
+        self.layers = nn.ModuleList(
+            [
+                nn.Linear(in_dim, 8),
+                nn.ReLU(),
+                nn.Linear(8, out_dim),
+                nn.ReLU(),
+            ]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
-    def get_rand_inputs(self, batch_size: int) -> torch.Tensor:
-        return torch.rand(batch_size, self.in_dim)
+    def get_rand_inputs(
+        self, batch_size: int, device: torch.device = torch.device("cpu")
+    ) -> torch.Tensor:
+        return torch.rand(batch_size, self.in_dim, device=device)
 
-    def get_rand_labels(self, batch_size: int) -> torch.Tensor:
-        return torch.randint(3, (batch_size,))
+    def get_rand_labels(
+        self, batch_size: int, device: torch.device = torch.device("cpu")
+    ) -> torch.Tensor:
+        return torch.randint(3, (batch_size,), device=device)
 
 
 class InjectedFailure(Exception):

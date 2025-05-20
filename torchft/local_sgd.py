@@ -249,7 +249,11 @@ class DiLoCo:
                     # we averaged the local version of the tensor so need to copy it back as a DTensor
                     p.data.copy_(
                         DTensor.from_local(
-                            self.original_parameters[name], p.device_mesh, p.placements
+                            self.original_parameters[name],
+                            p.device_mesh,
+                            p.placements,
+                            shape=p.shape,
+                            stride=p.stride(),
                         ),
                         non_blocking=False,
                     )
