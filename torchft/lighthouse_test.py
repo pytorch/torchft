@@ -4,6 +4,7 @@ from unittest import TestCase
 
 import torch.distributed as dist
 
+import torchft.coordination as cd
 from torchft import Manager, ProcessGroupGloo
 from torchft._torchft import LighthouseClient, LighthouseServer, Quorum, QuorumMember
 
@@ -155,3 +156,32 @@ class TestLighthouse(TestCase):
 
         finally:
             lighthouse.shutdown()
+
+    def test_multi_room_quorums(self) -> None:
+        """One server, two logical rooms should yield two isolated quorums."""
+        server = cd.LighthouseServer(bind="[::]:0", min_replicas=1)
+        addr = server.address()
+
+        try:
+            # Two clients in two independent rooms
+            cli_a = cd.LighthouseClient(addr, timedelta(seconds=1), room_id="jobA")
+            cli_b = cd.LighthouseClient(addr, timedelta(seconds=1), room_id="jobB")
+
+            # Explicit heartbeat so each room has one participant
+            cli_a.heartbeat("a0")
+            cli_b.heartbeat("b0")
+
+            q_a = cli_a.quorum("a0", timedelta(seconds=1))
+            q_b = cli_b.quorum("b0", timedelta(seconds=1))
+
+            # Both rooms got a quorum-id of 1 but with disjoint members
+            self.assertEqual(q_a.quorum_id, 1)
+            self.assertEqual(q_b.quorum_id, 1)
+
+            self.assertEqual(len(q_a.participants), 1)
+            self.assertEqual(len(q_b.participants), 1)
+            self.assertEqual(q_a.participants[0].replica_id, "a0")
+            self.assertEqual(q_b.participants[0].replica_id, "b0")
+
+        finally:
+            server.shutdown()
