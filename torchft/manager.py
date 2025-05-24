@@ -24,25 +24,29 @@ This is designed to work with the standard PyTorch DistributedDataParallel modul
 and Hybrid FSDP.
 
 """
-
 import concurrent.futures
 import logging
+import multiprocessing
 import os
 import socket
+import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from enum import Enum
+from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
 
 import torch
 from torch.distributed import ReduceOp, TCPStore
 
-from torchft._torchft import ManagerClient, ManagerServer
+from torchft._torchft import LighthouseClient, ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.futures import future_timeout
+from torchft.multiprocessing import _MonitoredPipe
 
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
@@ -103,6 +107,7 @@ class Manager:
         timeout: timedelta = timedelta(seconds=60),
         quorum_timeout: timedelta = timedelta(seconds=60),
         connect_timeout: timedelta = timedelta(seconds=60),
+        proactive_recovery_subscribe_timeout: timedelta = timedelta(milliseconds=100),
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         world_size_mode: WorldSizeMode = WorldSizeMode.DYNAMIC,
@@ -116,6 +121,7 @@ class Manager:
         checkpoint_transport: Optional[CheckpointTransport[Dict[str, T]]] = None,
         init_sync: bool = True,
         max_retries: Optional[int] = None,
+        proactive_recovery: bool = False,
     ) -> None:
         """
         Args:
@@ -166,6 +172,9 @@ class Manager:
         self._timeout = timeout
         self._quorum_timeout = quorum_timeout
         self._connect_timeout = connect_timeout
+        self._proactive_recovery_subscribe_timeout = (
+            proactive_recovery_subscribe_timeout
+        )
         self._replica_world_size_mode = world_size_mode
         self._init_sync = init_sync
         self._max_retries = max_retries
@@ -187,9 +196,7 @@ class Manager:
         self._checkpoint_transport: CheckpointTransport[Dict[str, T]] = (
             checkpoint_transport
         )
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="async_quorum"
-        )
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="")
         self._quorum_future: Optional[concurrent.futures.Future] = None
 
         self._store = TCPStore(
@@ -205,12 +212,57 @@ class Manager:
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
 
+        lighthouse_addr: Optional[str] = lighthouse_addr
+        if os.environ.get("TORCHFT_LIGHTHOUSE") is not None:
+            lighthouse_addr = (
+                lighthouse_addr or os.environ["TORCHFT_LIGHTHOUSE"]
+            )  # Else error in tests, since TORCHFT_LIGHTHOUSE may not be set
+
+        self._proactive_recovery = proactive_recovery or int(
+            os.environ.get("TORCHFT_PROACTIVE_RECOVERY", 0)
+        )
+
+        if lighthouse_addr is not None and self._proactive_recovery:
+            ctx = multiprocessing.get_context("spawn")
+            error_local, error_remote = ctx.Pipe()
+            self._error_pipe = _MonitoredPipe(error_local)
+            self._error_remote = _MonitoredPipe(error_remote)
+            self._failure_listener_stop_event = ctx.Event()
+
+            self._failure_listener_process = ctx.Process(
+                target=_failure_listener_process_main,
+                args=(
+                    lighthouse_addr,
+                    self._connect_timeout,
+                    self._failure_listener_stop_event,
+                    error_remote,
+                    self._proactive_recovery_subscribe_timeout,
+                ),
+                daemon=True,
+            )
+            self._failure_listener_process.start()
+        else:
+            self._failure_listener_process = None
+            self._error_pipe = None
+            self._failure_listener_stop_event = None
+
+        # Initialize and start the error processing thread if the listener process is active
+        self._error_processor_thread: Optional[threading.Thread] = None
+        self._error_processor_stop_event: Optional[threading.Event] = None
+        if self._failure_listener_process is not None:
+            self._error_processor_stop_event = threading.Event()
+            self._error_processor_thread = threading.Thread(
+                target=self._error_processor_loop,
+                name="TorchFTErrorProcessor",
+                daemon=True,
+            )
+            self._error_processor_thread.start()
+
         if self._group_rank == 0:
             if port is None:
                 port = int(os.environ.get(MANAGER_PORT_ENV, 0))
 
             bind = f"[::]:{port}"
-            lighthouse_addr = lighthouse_addr or os.environ["TORCHFT_LIGHTHOUSE"]
 
             # We need a unique identifier in the case that a worker restarts quickly and
             # replaces the previous worker with the same ID.
@@ -219,6 +271,7 @@ class Manager:
                 replica_id = new_uuid
             else:
                 replica_id = f"{replica_id}:{new_uuid}"
+
             self._manager = ManagerServer(
                 replica_id=replica_id,
                 lighthouse_addr=lighthouse_addr,
@@ -229,13 +282,11 @@ class Manager:
                 heartbeat_interval=heartbeat_interval,
                 connect_timeout=connect_timeout,
             )
-
             self._store.set(MANAGER_ADDR_KEY, self._manager.address())
             self._store.set(REPLICA_ID_KEY, replica_id)
 
         addr = self._store.get(MANAGER_ADDR_KEY).decode("utf-8")
         self._client = ManagerClient(addr, connect_timeout=connect_timeout)
-
         replica_id = self._store.get(REPLICA_ID_KEY).decode("utf-8")
         self._logger = _ManagerLogger(
             manager=self, replica_id=replica_id or "", group_rank=group_rank
@@ -258,13 +309,96 @@ class Manager:
         self._load_state_dict = load_state_dict
         self._user_state_dict = state_dict
 
+    def _error_handler(self, err):
+        self._logger.info(f"Received error: {err}")
+        self.report_error(err)
+        self._pg.abort()
+
+    def _error_processor_loop(self) -> None:
+        """Continuously checks the error pipe from the listener process and reports errors."""
+        assert (
+            self._error_pipe is not None
+        ), "Error pipe must be initialized for error processor loop."
+        assert (
+            self._error_processor_stop_event is not None
+        ), "Stop event must be initialized for error processor loop."
+
+        try:
+            while not self._error_processor_stop_event.is_set():
+                try:
+                    item = self._error_pipe.recv(0.1)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                except Exception as e:
+                    self._error_handler(e)
+        finally:
+            pass
+
     def shutdown(self, wait: bool = True) -> None:
         """
         Shutdown the manager and checkpoint server.
         """
-        self._checkpoint_transport.shutdown(wait=wait)
         if self._manager is not None:
             self._manager.shutdown()
+
+        # Stop the error processor thread first
+        if (
+            self._error_processor_thread is not None
+            and self._error_processor_stop_event is not None
+        ):
+            self._logger.info("Setting error processor thread stop event")
+            self._error_processor_stop_event.set()
+            if wait:
+                self._logger.info("Waiting for error processor thread to complete")
+                try:
+                    self._error_processor_thread.join(timeout=5)  # Short timeout
+                    if self._error_processor_thread.is_alive():
+                        self._logger.warn(
+                            "Error processor thread did not terminate in time."
+                        )
+                    else:
+                        self._logger.info("Error processor thread shutdown completed.")
+                except Exception as e:
+                    self._logger.warn(f"Error waiting for error processor thread: {e}")
+
+        # Stop the failure listener process if it exists
+        if (
+            hasattr(self, "_failure_listener_process")
+            and self._failure_listener_process is not None
+        ):
+            self._logger.info("Setting failure listener stop event for process")
+            if (
+                hasattr(self, "_failure_listener_stop_event")
+                and self._failure_listener_stop_event is not None
+            ):
+                self._failure_listener_stop_event.set()
+
+            if wait:
+                self._logger.info("Waiting for failure listener process to complete")
+                try:
+                    self._failure_listener_process.join(timeout=10)  # Process join
+                    if self._failure_listener_process.is_alive():
+                        self._logger.warn(
+                            "Failure listener process did not terminate, attempting to terminate."
+                        )
+                        self._failure_listener_process.terminate()  # Force terminate if join times out
+                        self._failure_listener_process.join(
+                            timeout=1
+                        )  # Wait for terminate
+                    else:
+                        self._logger.info("Failure listener process shutdown completed")
+                except Exception as e:
+                    self._logger.warn(
+                        f"Error waiting for/terminating failure listener process: {e}"
+                    )
+
+            # Clean up pipe
+            if hasattr(self, "_error_pipe") and self._error_pipe is not None:
+                self._error_pipe.close()
+
+        self._checkpoint_transport.shutdown(wait=wait)
         self._executor.shutdown(wait=wait)
 
     def allreduce(self, tensor: torch.Tensor) -> torch.futures.Future[torch.Tensor]:
@@ -824,3 +958,60 @@ class _ManagerLogger:
 
     def exception(self, msg: str) -> None:
         self._logger.exception(f"{self.prefix()} {msg}")
+
+
+def _failure_listener_process_main(
+    lighthouse_addr_str: Optional[str],
+    connect_timeout: timedelta,
+    stop_event: multiprocessing.Event,
+    error_pipe: Connection,
+    subscribe_timeout: timedelta = timedelta(milliseconds=100),
+):
+    """
+    Background process that monitors lighthouse for failures through gRPC stream (with an iterator interface) and reports them via error_pipe.
+    """
+    if not lighthouse_addr_str:
+        return
+
+    while not stop_event.is_set():
+        try:
+            lighthouse_client = LighthouseClient(
+                lighthouse_addr_str, connect_timeout=connect_timeout
+            )
+            stream = lighthouse_client.subscribe_failures(timeout=subscribe_timeout)
+            while not stop_event.is_set():
+                try:
+                    note = next(
+                        stream
+                    )  # This will block until a new item or timeout if stream supports it
+                    if note:
+                        if stop_event.is_set():
+                            break
+                        error = Exception(
+                            f"Peer failure detected in listener process: replica {note.replica_id} has failed"
+                        )
+                        error_pipe.send(ExceptionWithTraceback(error))
+                except StopIteration:
+                    # Stream has ended, break out to outer loop to reconnect
+                    if not stop_event.is_set():
+                        logging.warning(
+                            "Failure Listener: Stream ended unexpectedly, attempting to reconnect..."
+                        )
+                        break  # Break the inner loop to reconnect
+                    else:
+                        break
+                except Exception as e_stream:
+                    if not stop_event.is_set():
+                        continue  # Break due to subscribe_timeout. Allows the process to check stop_event again.
+                    else:
+                        break
+                if stop_event.is_set():
+                    break
+                time.sleep(0.01)  # Prevent CPU thrashing
+        except Exception as e_outer:
+            if not stop_event.is_set():
+                logging.warning(
+                    f"Failure Listener: Connection error: {e_outer}, retrying in 1 second..."
+                )
+                time.sleep(1)
+            pass

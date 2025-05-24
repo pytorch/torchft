@@ -246,6 +246,38 @@ CUDA_VISIBLE_DEVICES=1 TORCHFT_LIGHTHOUSE=http://localhost:29510 torchrun --mast
 
 By observing the outputs from both shells, you should observe process group reconfiguration and live checkpoint recovery.
 
+### Proactive Failure Recovery Mode (Experimental)
+
+You can experiment with proactive failure recovery mode by:
+
+```sh
+export TORCHFT_PROACTIVE_RECOVERY=1
+```
+
+With this enabled, the manager will listen to the Lighthouse server for heartbeat failures of other replica groups and break from a hanging allreduce.
+
+You can test this out by running `train_ddp_proactive.py`
+
+On shell 1 (one replica groups starts initial training):
+```sh
+export REPLICA_GROUP_ID=0
+export NUM_REPLICA_GROUPS=2
+export TORCHFT_PROACTIVE_RECOVERY=1
+
+CUDA_VISIBLE_DEVICES=0 TORCHFT_LIGHTHOUSE=http://localhost:29510 torchrun --master_port=29600 --nnodes=1 --nproc_per_node=1 -- train_ddp_proactive.py
+```
+
+On shell 2 (a second replica group joins):
+```sh
+export REPLICA_GROUP_ID=1
+export NUM_REPLICA_GROUPS=2
+export TORCHFT_PROACTIVE_RECOVERY=1
+
+CUDA_VISIBLE_DEVICES=1 TORCHFT_LIGHTHOUSE=http://localhost:29510 torchrun --master_port=29601 --nnodes=1 --nproc_per_node=1 -- train_ddp_proactive.py
+```
+
+You should observe that the process with replica group id 1 will exit early, and the process with replica group id 0 will quickly resume training. If the same script is ran with after setting `export TORCHFT_PROACTIVE_RECOVERY=0`, you should observe that the process with replica group id 1 will hang for dozens of seconds before continuing.
+
 ### Example Parameter Server
 
 torchft has a fault tolerant parameter server implementation built on it's
