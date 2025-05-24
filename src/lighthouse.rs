@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::{Instant, SystemTime};
 
+use crate::torchftpb::FailureNotification;
 use anyhow::{anyhow, Result};
 use askama::Template;
 use axum::{
@@ -21,24 +22,37 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono;
 use gethostname::gethostname;
-use log::{error, info};
+use log::{error, info, warn};
+use serde_json;
+use std::fs;
 use structopt::StructOpt;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::interval;
+use tokio_stream::wrappers::{
+    errors::BroadcastStreamRecvError as TokioStreamBroadcastStreamRecvError, BroadcastStream,
+};
+use tokio_stream::StreamExt;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use futures_core::Stream;
+use std::pin::Pin;
+
 use crate::manager::manager_client_new;
 use crate::torchftpb::{
     lighthouse_service_server::{LighthouseService, LighthouseServiceServer},
-    KillRequest, LighthouseHeartbeatRequest, LighthouseHeartbeatResponse, LighthouseQuorumRequest,
-    LighthouseQuorumResponse, Quorum, QuorumMember,
+    KillRequest, LighthouseConfigRequest, LighthouseConfigResponse, LighthouseHeartbeatRequest,
+    LighthouseHeartbeatResponse, LighthouseQuorumRequest, LighthouseQuorumResponse, Quorum,
+    QuorumMember, SubscribeFailuresRequest,
 };
+
+use serde::Deserialize;
 
 #[derive(Clone)]
 struct QuorumMemberDetails {
@@ -47,14 +61,31 @@ struct QuorumMemberDetails {
 }
 
 struct State {
-    channel: broadcast::Sender<Quorum>,
+    quorum_channel: broadcast::Sender<Quorum>,
+    // Tracks currently active participants in the process of forming a quorum.
+    // Replicas are added upon receiving a `LighthouseQuorumRequest`.
+    // Replicas are cleared after a quorum is successfully formed OR
+    // removed by `_failure_tick` if their heartbeat expires.
     participants: HashMap<String, QuorumMemberDetails>,
     prev_quorum: Option<Quorum>,
     quorum_id: i64,
 
-    // heartbeat information
-    // replica_id -> last heartbeat
+    // Stores the last heartbeat time for each replica ID.
+    // Replicas are added/updated upon receiving `LighthouseHeartbeatRequest` or `LighthouseQuorumRequest`.
+    // Replicas are removed by `_failure_tick` if their heartbeat expires and a failure notification is sent.
     heartbeats: HashMap<String, Instant>,
+
+    // Stores the timestamp of when a replica was first detected as failed (heartbeat expired).
+    // This is used to ensure only one `FailureNotification` is sent per failure event.
+    // Replicas are added by `_failure_tick` upon detecting a new failure.
+    // Replicas are removed by `_failure_tick` if a subsequent heartbeat is received (signifying recovery).
+    failures: HashMap<String, Instant>,
+
+    // Broadcast channel for sending failure notifications to subscribers.
+    pub failure_channel: broadcast::Sender<FailureNotification>,
+
+    // Configuration data as serde_json::Map (loaded from config file if provided)
+    config_data: serde_json::Map<String, serde_json::Value>,
 }
 
 pub struct Lighthouse {
@@ -83,7 +114,7 @@ impl ChangeLogger {
     }
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt, Debug, Clone)]
 #[structopt()]
 pub struct LighthouseOpt {
     // bind is the address to bind the server to.
@@ -120,6 +151,19 @@ pub struct LighthouseOpt {
         help = "How long to wait for a heartbeat before considering a replica dead."
     )]
     pub heartbeat_timeout_ms: u64,
+
+    #[structopt(
+        long = "failure_tick_ms",
+        default_value = "1000",
+        help = "How frequently to check for failures."
+    )]
+    pub failure_tick_ms: u64,
+
+    #[structopt(
+        long = "lighthouse_config",
+        help = "Path to configuration file (JSON format)"
+    )]
+    pub lighthouse_config: Option<String>,
 }
 
 fn quorum_changed(a: &Vec<QuorumMember>, b: &Vec<QuorumMember>) -> bool {
@@ -260,19 +304,89 @@ fn quorum_compute(
     )
 }
 
+fn load_config(config_path: &Option<String>) -> serde_json::Map<String, serde_json::Value> {
+    match config_path {
+        Some(path) => {
+            match fs::read_to_string(path) {
+                Ok(content) => {
+                    // Parse JSON into Map
+                    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &content,
+                    ) {
+                        Ok(json_map) => {
+                            info!("Successfully loaded config from {}", path);
+                            json_map
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Invalid JSON in config file {}: {}. Using empty config.",
+                                path, e
+                            );
+                            serde_json::Map::new()
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to read config file {}: {}. Using empty config.",
+                        path, e
+                    );
+                    serde_json::Map::new()
+                }
+            }
+        }
+        None => serde_json::Map::new(),
+    }
+}
+
 impl Lighthouse {
     pub async fn new(opt: LighthouseOpt) -> Result<Arc<Self>> {
         let listener = tokio::net::TcpListener::bind(&opt.bind).await?;
 
+        // Load configuration data
+        let config_data = load_config(&opt.lighthouse_config);
+
         let (tx, _) = broadcast::channel(16);
+        let (failure_tx, failure_rx) = broadcast::channel::<FailureNotification>(16);
+
+        // Create a task to monitor the failure channel
+        let mut failure_rx_cloned: broadcast::Receiver<FailureNotification> =
+            failure_rx.resubscribe();
+        tokio::spawn(async move {
+            use tokio::time::{sleep, Duration};
+            info!("Starting permanent failure channel subscriber");
+            loop {
+                match failure_rx_cloned.recv().await {
+                    Ok(note) => {
+                        info!(
+                            "Healthy replicas received failure notification for {} with error message: {}",
+                            note.replica_id,
+                            note.error_message
+                        );
+                    }
+                    Err(e) => {
+                        error!("Healthy replicas error: {}", e);
+                        // If the channel is closed, break the loop
+                        if matches!(e, tokio::sync::broadcast::error::RecvError::Closed) {
+                            break;
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(100)).await; // Prevent thrashing if there are continuous errors
+            }
+            info!("Permanent failure channel subscriber exiting");
+        });
 
         Ok(Arc::new(Self {
             state: Mutex::new(State {
                 participants: HashMap::new(),
-                channel: tx,
+                quorum_channel: tx,
                 prev_quorum: None,
                 quorum_id: 0,
                 heartbeats: HashMap::new(),
+                failures: HashMap::new(),
+                failure_channel: failure_tx,
+                config_data: config_data,
             }),
             opt: opt,
             local_addr: listener.local_addr()?,
@@ -326,7 +440,7 @@ impl Lighthouse {
 
             state.prev_quorum = Some(quorum.clone());
             state.participants.clear();
-            match state.channel.send(quorum) {
+            match state.quorum_channel.send(quorum) {
                 Ok(_) => (),
                 Err(e) => error!("failed to send quorum {}", e),
             }
@@ -372,6 +486,19 @@ impl Lighthouse {
                 }),
             )
             .route(
+                "/config",
+                get({
+                    let self_clone = self.clone();
+                    move || async { self_clone.get_config_page().await }
+                })
+                .put({
+                    let self_clone = self.clone();
+                    move |form_data: axum::extract::Form<ConfigUpdateForm>| async move {
+                        self_clone.update_config(form_data).await
+                    }
+                }),
+            )
+            .route(
                 "/replica/:replica_id/kill",
                 post({
                     let self_clone = self.clone();
@@ -391,12 +518,84 @@ impl Lighthouse {
             .map_err(|e| e.into())
     }
 
+    async fn _run_failure_tick(self: Arc<Self>) -> Result<()> {
+        let mut interval = interval(Duration::from_millis(self.opt.failure_tick_ms));
+        loop {
+            interval.tick().await; // Wait for the next tick
+            let mut state = self.state.lock().await;
+            self.clone()._failure_tick(&mut state)?;
+        }
+    }
+
+    fn _failure_tick(self: Arc<Self>, state: &mut State) -> Result<()> {
+        let now = Instant::now();
+        let timeout = Duration::from_millis(self.opt.heartbeat_timeout_ms);
+
+        // Use a temporary list to collect replica IDs to remove from heartbeats
+        // to avoid modifying the map while iterating over it.
+        let mut failed_replica_ids_to_remove_from_heartbeats = Vec::new();
+        let mut failure_detected = false;
+
+        for (replica_id, last_heartbeat) in state.heartbeats.iter() {
+            if now.duration_since(*last_heartbeat) > timeout {
+                if !state.failures.contains_key(replica_id) {
+                    info!(
+                        "Replica {} timed out (last heartbeat: {:?}), sending failure notification.",
+                        replica_id,
+                        last_heartbeat
+                    );
+                    if let Err(e) = state.failure_channel.send(FailureNotification {
+                        replica_id: replica_id.clone(),
+                        error_message: "heartbeat timeout".to_string(),
+                    }) {
+                        error!(
+                            "Failed to send failure notification for {}: {} (receiver count: {})",
+                            replica_id,
+                            e,
+                            state.failure_channel.receiver_count()
+                        );
+                    } else {
+                        failure_detected = true; // Set flag if notification sent successfully
+                    }
+                    // Record failure information
+                    state.failures.insert(replica_id.clone(), now);
+                    state.participants.remove(replica_id);
+                    failed_replica_ids_to_remove_from_heartbeats.push(replica_id.clone());
+                }
+            } else {
+                // If the participant sends heartbeat again, remove it from failures.
+                if state.failures.remove(replica_id).is_some() {
+                    info!("Replica {} recovered from failure.", replica_id);
+                }
+            }
+        }
+
+        // Remove failed replicas from heartbeats
+        for replica_id in failed_replica_ids_to_remove_from_heartbeats {
+            state.heartbeats.remove(&replica_id);
+            info!(
+                "Removed replica {} from heartbeats and participants due to timeout.",
+                replica_id
+            );
+        }
+
+        // If a new failure was detected and broadcasted, reset participants to restart quorum formation
+        if failure_detected {
+            info!("New failure detected, resetting all participants for quorum formation.");
+            state.participants.clear();
+        }
+
+        Ok(())
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let mut set = JoinSet::new();
 
         set.spawn(self.clone()._run_quorum());
 
         set.spawn(self.clone()._run_grpc());
+
+        set.spawn(self.clone()._run_failure_tick());
 
         while let Some(res) = set.join_next().await {
             res??;
@@ -469,6 +668,98 @@ impl Lighthouse {
 
         Ok(())
     }
+
+    async fn get_config_page(self: Arc<Self>) -> Html<String> {
+        self.get_config_page_with_message("".to_string()).await
+    }
+
+    async fn get_config_page_with_message(
+        self: Arc<Self>,
+        success_message: String,
+    ) -> Html<String> {
+        let config_data = {
+            let state = self.state.lock().await;
+            // Serialize Map to JSON string for the web interface
+            match serde_json::to_string_pretty(&state.config_data) {
+                Ok(json_str) => json_str,
+                Err(_) => "{}".to_string(),
+            }
+        };
+
+        let timestamp = chrono::Utc::now()
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string();
+
+        let template = ConfigTemplate {
+            config_data: config_data,
+            timestamp: timestamp,
+            success_message: if success_message.is_empty() {
+                None
+            } else {
+                Some(success_message)
+            },
+        };
+        Html(template.render().unwrap())
+    }
+
+    async fn update_config(
+        self: Arc<Self>,
+        axum::extract::Form(form_data): axum::extract::Form<ConfigUpdateForm>,
+    ) -> Result<Html<String>, AppError> {
+        let new_config_json = form_data.config;
+
+        info!("Update config called with: {}", new_config_json);
+
+        // Parse and validate the JSON into a Map
+        let new_config_map = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &new_config_json,
+        ) {
+            Ok(json_map) => json_map,
+            Err(e) => {
+                warn!("Invalid JSON provided via web interface: {}", e);
+                return Err(AppError(anyhow!("Invalid JSON: {}", e)));
+            }
+        };
+
+        // Update the config in the lighthouse state
+        {
+            let mut state = self.state.lock().await;
+            state.config_data = new_config_map.clone();
+        }
+
+        // Log the updated configuration content
+        match serde_json::to_string_pretty(&new_config_map) {
+            Ok(pretty_json) => {
+                info!(
+                    "Config updated successfully via web interface. New configuration:\n{}",
+                    pretty_json
+                );
+            }
+            Err(_) => {
+                info!(
+                    "Config updated successfully via web interface. New configuration: {:?}",
+                    new_config_map
+                );
+            }
+        }
+
+        // Return the updated config page with success message
+        Ok(self
+            .get_config_page_with_message("Configuration updated successfully!".to_string())
+            .await)
+    }
+
+    pub async fn inject_failure(self: Arc<Self>, replica_id: String) -> Result<()> {
+        let state = self.state.lock().await;
+        state
+            .failure_channel
+            .send(FailureNotification {
+                replica_id,
+                error_message: "injected failure".to_string(),
+            })
+            .map_err(|e| anyhow!("Failed to send failure notification: {}", e))?;
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -502,7 +793,7 @@ impl LighthouseService for Arc<Lighthouse> {
                     member: requester.clone(),
                 },
             );
-            let rx = state.channel.subscribe();
+            let rx = state.quorum_channel.subscribe();
 
             // proactively run quorum tick
             self.clone()
@@ -556,6 +847,59 @@ impl LighthouseService for Arc<Lighthouse> {
         let reply = LighthouseHeartbeatResponse {};
         Ok(Response::new(reply))
     }
+
+    type SubscribeFailuresStream =
+        Pin<Box<dyn Stream<Item = Result<FailureNotification, Status>> + Send + 'static>>;
+
+    async fn subscribe_failures(
+        &self,
+        _req: Request<SubscribeFailuresRequest>,
+    ) -> Result<Response<Self::SubscribeFailuresStream>, Status> {
+        // clone a receiver
+        let rx = {
+            let state = self.state.lock().await;
+            let receiver_count = state.failure_channel.receiver_count();
+            info!(
+                "subscribe_failures: Creating new subscriber (current count: {})",
+                receiver_count
+            );
+            state.failure_channel.subscribe()
+        };
+
+        // Wrap the receiver; map its *internal* error into `tonic::Status`
+        let stream = BroadcastStream::new(rx).filter_map(|res| match res {
+            Ok(note) => Some(Ok(note)),
+            Err(TokioStreamBroadcastStreamRecvError::Lagged(n)) => Some(Err(
+                Status::resource_exhausted(format!("client lagged {n} messages")),
+            )),
+        });
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn get_config(
+        &self,
+        _request: Request<LighthouseConfigRequest>,
+    ) -> Result<Response<LighthouseConfigResponse>, Status> {
+        let config_data = {
+            let state = self.state.lock().await;
+            // Convert serde_json::Map to HashMap<String, String> for protobuf
+            state
+                .config_data
+                .iter()
+                .map(|(k, v)| {
+                    let value_str = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    };
+                    (k.clone(), value_str)
+                })
+                .collect()
+        };
+
+        let reply = LighthouseConfigResponse { config_data };
+        Ok(Response::new(reply))
+    }
 }
 
 #[derive(Template)]
@@ -574,6 +918,14 @@ struct StatusTemplate {
 
     // visualization thresholds
     old_age_threshold: Instant,
+}
+
+#[derive(Template)]
+#[template(path = "config.html")]
+struct ConfigTemplate {
+    config_data: String,
+    timestamp: String,
+    success_message: Option<String>,
 }
 
 // Make our own error that wraps `anyhow::Error`.
@@ -601,10 +953,17 @@ where
     }
 }
 
+#[derive(Deserialize)]
+struct ConfigUpdateForm {
+    config: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ops::Sub;
+    use tokio::sync::broadcast::error::RecvError as TokioBroadcastRecvError;
+    use tokio::time::timeout as tokio_timeout;
 
     use tonic::transport::Channel;
 
@@ -624,14 +983,19 @@ mod tests {
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         let mut state = State {
-            channel: broadcast::channel(16).0,
+            quorum_channel: broadcast::channel(16).0,
             participants: HashMap::new(),
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            failures: HashMap::new(),
+            failure_channel: broadcast::channel(16).0,
+            config_data: serde_json::Map::new(),
         };
 
         let now = Instant::now();
@@ -703,14 +1067,19 @@ mod tests {
             join_timeout_ms: 0,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         let mut state = State {
-            channel: broadcast::channel(16).0,
+            quorum_channel: broadcast::channel(16).0,
             participants: HashMap::new(),
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            failures: HashMap::new(),
+            failure_channel: broadcast::channel(16).0,
+            config_data: serde_json::Map::new(),
         };
 
         let now = Instant::now();
@@ -789,14 +1158,19 @@ mod tests {
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         let mut state = State {
-            channel: broadcast::channel(16).0,
+            quorum_channel: broadcast::channel(16).0,
             participants: HashMap::new(),
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            failures: HashMap::new(),
+            failure_channel: broadcast::channel(16).0,
+            config_data: serde_json::Map::new(),
         };
 
         let now = Instant::now();
@@ -879,14 +1253,19 @@ mod tests {
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         let mut state = State {
-            channel: broadcast::channel(16).0,
+            quorum_channel: broadcast::channel(16).0,
             participants: HashMap::new(),
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            failures: HashMap::new(),
+            failure_channel: broadcast::channel(16).0,
+            config_data: serde_json::Map::new(),
         };
 
         let now = Instant::now();
@@ -974,6 +1353,8 @@ mod tests {
             join_timeout_ms: 1,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
         let lighthouse = Lighthouse::new(opt).await?;
 
@@ -1020,14 +1401,19 @@ mod tests {
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         let mut state = State {
-            channel: broadcast::channel(16).0,
+            quorum_channel: broadcast::channel(16).0,
             participants: HashMap::new(),
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            failures: HashMap::new(),
+            failure_channel: broadcast::channel(16).0,
+            config_data: serde_json::Map::new(),
         };
 
         let now = Instant::now();
@@ -1103,6 +1489,186 @@ mod tests {
         assert!(quorum_changed(&a, &c));
     }
 
+    // Helper to create a default QuorumMember for tests
+    fn test_quorum_member(replica_id: &str) -> QuorumMember {
+        QuorumMember {
+            replica_id: replica_id.to_string(),
+            address: format!("addr_{}", replica_id),
+            store_address: format!("store_{}", replica_id),
+            step: 1,
+            world_size: 2, // Assuming 2 for this test context
+            shrink_only: false,
+            data: String::new(),
+            commit_failures: 0,
+        }
+    }
+
+    /// Test that `_failure_tick` correctly identifies timed-out replicas,
+    /// broadcasts a failure notification exactly once per failure, and
+    /// cleans up the replica from `heartbeats` and `participants` while
+    /// adding it to `failures`. Subsequent ticks should not re-notify
+    /// or change the state for an already failed replica.
+    #[tokio::test]
+    async fn test_failure_tick_single_notification_and_cleanup() -> Result<()> {
+        let opt = LighthouseOpt {
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 0,        // Not relevant for this test
+            quorum_tick_ms: 10,        // Not directly relevant but keep it small
+            heartbeat_timeout_ms: 100, // Reasonably short for testing
+            failure_tick_ms: 50,       // How often _failure_tick would be called
+            lighthouse_config: None,
+        };
+        let lighthouse = Lighthouse::new(opt.clone()).await?;
+
+        let mut failure_rx = {
+            let state_guard = lighthouse.state.lock().await;
+            state_guard.failure_channel.subscribe()
+        };
+
+        let replica_id_failing = "failing_one";
+
+        let now = Instant::now();
+        // Ensure expired_time is definitively older than heartbeat_timeout_ms
+        let expired_time = now - Duration::from_millis(opt.heartbeat_timeout_ms * 2);
+
+        // Setup initial state: one about to fail
+        {
+            let mut state_guard = lighthouse.state.lock().await;
+            let state = &mut *state_guard;
+
+            // Failing replica
+            state.participants.insert(
+                replica_id_failing.to_string(),
+                QuorumMemberDetails {
+                    joined: now, // Joined time doesn't prevent failure due to heartbeat
+                    member: test_quorum_member(replica_id_failing),
+                },
+            );
+            state
+                .heartbeats
+                .insert(replica_id_failing.to_string(), expired_time);
+        }
+
+        // --- First call to _failure_tick ---
+        // This call should detect the failure, send a notification, and update state.
+        {
+            let mut state_guard = lighthouse.state.lock().await;
+            lighthouse.clone()._failure_tick(&mut *state_guard)?;
+        }
+
+        // Assertions after first tick
+        // 1. Check notification for failing_replica
+        match tokio_timeout(
+            Duration::from_millis(opt.failure_tick_ms * 2),
+            failure_rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(notification)) => {
+                assert_eq!(
+                    notification.replica_id, replica_id_failing,
+                    "Notification should be for the failing replica"
+                );
+            }
+            Ok(Err(TokioBroadcastRecvError::Lagged(n))) => {
+                panic!(
+                    "Broadcast channel lagged by {} messages, missed the failure notification",
+                    n
+                );
+            }
+            Ok(Err(TokioBroadcastRecvError::Closed)) => {
+                panic!("Broadcast channel closed unexpectedly after first tick");
+            }
+            Err(_) => panic!(
+                "Did not receive failure notification for {} in time",
+                replica_id_failing
+            ),
+        }
+
+        // 2. Verify state changes
+        {
+            let state_guard = lighthouse.state.lock().await;
+            let state = &*state_guard;
+
+            // Failing replica assertions
+            assert!(
+                state.failures.contains_key(replica_id_failing),
+                "{} should be in failures map",
+                replica_id_failing
+            );
+            assert!(
+                !state.heartbeats.contains_key(replica_id_failing),
+                "{} should be removed from heartbeats",
+                replica_id_failing
+            );
+            assert!(
+                !state.participants.contains_key(replica_id_failing),
+                "{} should be removed from participants",
+                replica_id_failing
+            );
+        }
+
+        // --- Second call to _failure_tick ---
+        // This call should *not* detect a *new* failure for the same replica
+        // and should not send another notification.
+        {
+            let mut state_guard = lighthouse.state.lock().await;
+            lighthouse.clone()._failure_tick(&mut *state_guard)?;
+        }
+
+        // Assertions after second tick
+        // 1. No new notification for failing_replica
+        match tokio_timeout(
+            Duration::from_millis(opt.failure_tick_ms * 2),
+            failure_rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(notification)) => {
+                panic!(
+                    "Received unexpected second failure notification for {}",
+                    notification.replica_id
+                );
+            }
+            Ok(Err(TokioBroadcastRecvError::Lagged(n))) => {
+                // This might happen if the test environment is slow and ticks are processed faster than receives.
+                // For this specific assertion (no *new* message), lagging is an acceptable outcome.
+                info!("Broadcast channel lagged by {} messages on second check, implies no new distinct message.", n);
+            }
+            Ok(Err(TokioBroadcastRecvError::Closed)) => {
+                // Channel might close if sender is dropped, implies no new message.
+                info!("Broadcast channel closed on second check, implies no new distinct message.");
+            }
+            Err(_) => {
+                // Expected: Timeout, meaning no new message was received for failing_replica.
+            }
+        }
+
+        // 2. Verify state remains consistent for failing_replica
+        {
+            let state_guard = lighthouse.state.lock().await;
+            let state = &*state_guard;
+
+            assert!(
+                state.failures.contains_key(replica_id_failing),
+                "{} should remain in failures map",
+                replica_id_failing
+            );
+            assert!(
+                !state.heartbeats.contains_key(replica_id_failing),
+                "{} should remain removed from heartbeats",
+                replica_id_failing
+            );
+            assert!(
+                !state.participants.contains_key(replica_id_failing),
+                "{} should remain removed from participants",
+                replica_id_failing
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_lighthouse_join_during_shrink() -> Result<()> {
         fn create_member(id: &str, addr_num: &str, step: i64, shrink_only: bool) -> QuorumMember {
@@ -1130,6 +1696,8 @@ mod tests {
             join_timeout_ms: 1000,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         // Start the lighthouse service
@@ -1237,6 +1805,8 @@ mod tests {
             join_timeout_ms: 1000,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
         };
 
         // Start the lighthouse service
@@ -1279,6 +1849,182 @@ mod tests {
         assert_eq!(first_quorum.participants[1].commit_failures, 2);
 
         lighthouse_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lighthouse_subscribe_failures_basic() -> Result<()> {
+        let opt = LighthouseOpt {
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 60 * 60 * 1000, // 1hr
+            quorum_tick_ms: 10,
+            heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
+        };
+
+        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse_task = tokio::spawn(lighthouse.clone().run());
+
+        let mut client = lighthouse_client_new(lighthouse.address()).await?;
+        let request = tonic::Request::new(SubscribeFailuresRequest {});
+        client.subscribe_failures(request).await?;
+
+        lighthouse_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_failures_delivers_notifications() -> Result<()> {
+        let opt = LighthouseOpt {
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 60 * 60 * 1000,
+            quorum_tick_ms: 10,
+            heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
+        };
+        let lighthouse = Lighthouse::new(opt).await?;
+        let mut client = lighthouse_client_new(lighthouse.address()).await?;
+        let lighthouse_task = tokio::spawn(lighthouse.clone().run());
+
+        // 1. Subscribe with a deadline
+        let mut req = tonic::Request::new(SubscribeFailuresRequest {});
+        req.set_timeout(Duration::from_secs(5));
+        let mut stream = client.subscribe_failures(req).await?.into_inner();
+
+        // 2. Trigger a failure notification
+        {
+            let state = lighthouse.state.lock().await;
+            state
+                .failure_channel
+                .send(FailureNotification {
+                    replica_id: "replica_id_X".into(),
+                    error_message: "injected failure".to_string(),
+                })
+                .unwrap();
+        }
+
+        // 3. Ensure we receive it
+        match stream.next().await {
+            Some(Ok(note)) => {
+                assert_eq!(note.replica_id, "replica_id_X");
+                assert_eq!(note.error_message, "injected failure");
+            }
+            other => panic!("Expected notification, got {:?}", other),
+        }
+
+        lighthouse_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_config_broadcasting() -> Result<()> {
+        // Create a test config file
+        let test_config =
+            r#"{"learning_rate": "0.001", "batch_size": "32", "model_type": "transformer"}"#;
+        std::fs::write("test_config_temp.json", test_config).unwrap();
+
+        let opt = LighthouseOpt {
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 60000,
+            quorum_tick_ms: 100,
+            heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: Some("test_config_temp.json".to_string()),
+        };
+
+        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse_task = tokio::spawn(lighthouse.clone().run());
+
+        let mut client = lighthouse_client_new(lighthouse.address()).await?;
+
+        let request = tonic::Request::new(LighthouseConfigRequest {});
+        let response = client.get_config(request).await?;
+        let config_data = response.into_inner().config_data;
+
+        // Verify the config was loaded and parsed correctly
+        assert_eq!(config_data.get("learning_rate"), Some(&"0.001".to_string()));
+        assert_eq!(config_data.get("batch_size"), Some(&"32".to_string()));
+        assert_eq!(
+            config_data.get("model_type"),
+            Some(&"transformer".to_string())
+        );
+        assert_eq!(config_data.len(), 3);
+
+        lighthouse_task.abort();
+
+        // Clean up test file
+        std::fs::remove_file("test_config_temp.json").unwrap();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_config_broadcasting_no_config() -> Result<()> {
+        let opt = LighthouseOpt {
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 60000,
+            quorum_tick_ms: 100,
+            heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: None,
+        };
+
+        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse_task = tokio::spawn(lighthouse.clone().run());
+
+        let mut client = lighthouse_client_new(lighthouse.address()).await?;
+
+        let request = tonic::Request::new(LighthouseConfigRequest {});
+        let response = client.get_config(request).await?;
+        let config_data = response.into_inner().config_data;
+
+        // When no config is provided, should return empty map
+        assert_eq!(config_data.len(), 0);
+
+        lighthouse_task.abort();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_config_broadcasting_invalid_json() -> Result<()> {
+        // Create an invalid JSON file
+        let invalid_json = r#"{"learning_rate": "0.001", "batch_size": 32 // invalid comment"#;
+        std::fs::write("test_invalid_config.json", invalid_json).unwrap();
+
+        let opt = LighthouseOpt {
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 60000,
+            quorum_tick_ms: 100,
+            heartbeat_timeout_ms: 5000,
+            failure_tick_ms: 1000,
+            lighthouse_config: Some("test_invalid_config.json".to_string()),
+        };
+
+        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse_task = tokio::spawn(lighthouse.clone().run());
+
+        let mut client = lighthouse_client_new(lighthouse.address()).await?;
+
+        let request = tonic::Request::new(LighthouseConfigRequest {});
+        let response = client.get_config(request).await?;
+        let config_data = response.into_inner().config_data;
+
+        // When invalid JSON is provided, should return empty map
+        assert_eq!(config_data.len(), 0);
+
+        lighthouse_task.abort();
+
+        // Clean up test file
+        std::fs::remove_file("test_invalid_config.json").unwrap();
+
         Ok(())
     }
 }

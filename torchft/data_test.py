@@ -27,7 +27,7 @@ class TestData(TestCase):
         dataset = DummyDataset(1000)
         sampler = DistributedSampler(
             dataset,
-            replica_rank=1,
+            replica_group_id=1,
             num_replica_groups=2,
             group_rank=3,
             num_replicas=4,

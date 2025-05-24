@@ -13,7 +13,7 @@ mod timeout;
 use anyhow::Result;
 use atty::Stream;
 use core::time::Duration;
-use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyTimeoutError};
 use std::cmp;
 use std::env;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use std::thread::available_parallelism;
 use structopt::StructOpt;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::Status;
 
@@ -35,11 +36,13 @@ pub mod torchftpb {
 use crate::torchftpb::lighthouse_service_client::LighthouseServiceClient;
 use crate::torchftpb::manager_service_client::ManagerServiceClient;
 use crate::torchftpb::{
-    CheckpointMetadataRequest, LighthouseHeartbeatRequest, LighthouseQuorumRequest,
-    ManagerQuorumRequest, ShouldCommitRequest,
+    CheckpointMetadataRequest, FailureNotification as ProtoFailureNotification,
+    LighthouseConfigRequest, LighthouseHeartbeatRequest, LighthouseQuorumRequest,
+    ManagerQuorumRequest, ShouldCommitRequest, SubscribeFailuresRequest,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
+use pyo3::{PyRef, PyRefMut};
 
 // Get the number of threads to use for the tokio runtime
 fn num_threads() -> usize {
@@ -290,6 +293,45 @@ struct QuorumResult {
     heal: bool,
 }
 
+#[pyclass(unsendable)]
+struct FailureStream {
+    runtime: Arc<Runtime>,
+    stream: tonic::Streaming<ProtoFailureNotification>,
+    timeout: Duration,
+}
+
+#[pymethods]
+impl FailureStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<FailureNotification> {
+        let runtime = slf.runtime.clone();
+        let timeout = slf.timeout;
+        // borrow stream mutably for the whole async block
+        let fut = async { tokio::time::timeout(timeout, slf.stream.next()).await };
+
+        match runtime.block_on(fut) {
+            Ok(Some(Ok(note))) => Ok(FailureNotification {
+                replica_id: note.replica_id,
+                error_message: note.error_message,
+            }),
+            Ok(Some(Err(status))) => Err(StatusError(status).into()),
+            Ok(None) => Err(PyStopIteration::new_err(())),
+            Err(_) => Err(PyTimeoutError::new_err(
+                "Timeout waiting for failure notification",
+            )),
+        }
+    }
+}
+
+#[pyclass(get_all, set_all)]
+#[derive(Clone)]
+struct FailureNotification {
+    replica_id: String,
+    error_message: String,
+}
+
 #[pymethods]
 impl QuorumResult {
     #[new]
@@ -478,7 +520,7 @@ fn convert_quorum(py: Python, q: &torchftpb::Quorum) -> PyResult<Quorum> {
 #[pyclass]
 struct LighthouseClient {
     client: LighthouseServiceClient<Channel>,
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
 }
 
 #[pymethods]
@@ -487,11 +529,13 @@ impl LighthouseClient {
     #[new]
     fn new(py: Python<'_>, addr: String, connect_timeout: Duration) -> PyResult<Self> {
         py.allow_threads(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_threads())
-                .thread_name("torchft-lhclnt")
-                .enable_all()
-                .build()?;
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(num_threads())
+                    .thread_name("torchft-lhclnt")
+                    .enable_all()
+                    .build()?,
+            );
             let client = runtime
                 .block_on(manager::lighthouse_client_new(addr, connect_timeout))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -586,6 +630,44 @@ impl LighthouseClient {
             Ok(())
         })
     }
+
+    #[pyo3(signature = (timeout = Duration::from_secs(5)))]
+    fn subscribe_failures(&self, py: Python<'_>, timeout: Duration) -> PyResult<FailureStream> {
+        py.allow_threads(move || {
+            let req = tonic::Request::new(SubscribeFailuresRequest {});
+            let response = self
+                .runtime
+                .block_on(self.client.clone().subscribe_failures(req))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(FailureStream {
+                runtime: self.runtime.clone(),
+                stream: response.into_inner(),
+                timeout: timeout,
+            })
+        })
+    }
+
+    /// Get configuration data from the lighthouse server.
+    ///
+    /// Returns:
+    ///     dict[str, str]: The configuration data as a dictionary.
+    ///
+    /// Args:
+    ///     timeout (timedelta, optional): Per-RPC deadline. Default = 5 s.
+    #[pyo3(signature = (timeout = Duration::from_secs(5)))]
+    fn get_config(
+        &self,
+        py: Python<'_>,
+        timeout: Duration,
+    ) -> Result<std::collections::HashMap<String, String>, StatusError> {
+        py.allow_threads(move || {
+            let mut req = tonic::Request::new(LighthouseConfigRequest {});
+            req.set_timeout(timeout);
+            let response = self.runtime.block_on(self.client.clone().get_config(req))?;
+            let config_data = response.into_inner().config_data;
+            Ok(config_data)
+        })
+    }
 }
 
 /// LighthouseServer is a GRPC server for the lighthouse service.
@@ -601,6 +683,7 @@ impl LighthouseClient {
 ///     join_timeout_ms (int): The timeout for joining the quorum.
 ///     quorum_tick_ms (int): The interval at which the quorum is checked.
 ///     heartbeat_timeout_ms (int): The timeout for heartbeats.
+///     lighthouse_config (str, optional): Path to configuration file (JSON format).
 #[pyclass]
 struct LighthouseServer {
     lighthouse: Arc<lighthouse::Lighthouse>,
@@ -610,7 +693,7 @@ struct LighthouseServer {
 
 #[pymethods]
 impl LighthouseServer {
-    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None))]
+    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None, failure_tick_ms=None, lighthouse_config=None))]
     #[new]
     fn new(
         py: Python<'_>,
@@ -619,10 +702,13 @@ impl LighthouseServer {
         join_timeout_ms: Option<u64>,
         quorum_tick_ms: Option<u64>,
         heartbeat_timeout_ms: Option<u64>,
+        failure_tick_ms: Option<u64>,
+        lighthouse_config: Option<String>,
     ) -> PyResult<Self> {
         let join_timeout_ms = join_timeout_ms.unwrap_or(100);
         let quorum_tick_ms = quorum_tick_ms.unwrap_or(100);
         let heartbeat_timeout_ms = heartbeat_timeout_ms.unwrap_or(5000);
+        let failure_tick_ms = failure_tick_ms.unwrap_or(1000);
 
         py.allow_threads(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -638,6 +724,8 @@ impl LighthouseServer {
                     join_timeout_ms: join_timeout_ms,
                     quorum_tick_ms: quorum_tick_ms,
                     heartbeat_timeout_ms: heartbeat_timeout_ms,
+                    failure_tick_ms: failure_tick_ms,
+                    lighthouse_config: lighthouse_config,
                 }))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -662,6 +750,22 @@ impl LighthouseServer {
         py.allow_threads(move || {
             self.handle.abort();
         })
+    }
+
+    /// inject_failure broadcasts a failure notification for the given replica.
+    ///
+    /// This helper is intended for testing `subscribe_failures` from Python.
+    #[pyo3(signature = (replica_id))]
+    fn inject_failure(&self, py: Python<'_>, replica_id: String) {
+        let lighthouse = self.lighthouse.clone();
+        let runtime = &self._runtime;
+        py.allow_threads(move || {
+            let _ = runtime.block_on(async {
+                if let Err(e) = lighthouse.inject_failure(replica_id).await {
+                    eprintln!("Failed to inject failure: {}", e);
+                }
+            });
+        });
     }
 }
 
@@ -750,6 +854,8 @@ fn _torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LighthouseServer>()?;
     m.add_class::<LighthouseClient>()?;
     m.add_class::<QuorumResult>()?;
+    m.add_class::<FailureNotification>()?;
+    m.add_class::<FailureStream>()?;
     m.add_function(wrap_pyfunction!(lighthouse_main, m)?)?;
 
     Ok(())

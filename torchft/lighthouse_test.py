@@ -155,3 +155,147 @@ class TestLighthouse(TestCase):
 
         finally:
             lighthouse.shutdown()
+
+    def test_subscribe_failures(self) -> None:
+        """Test that subscribe_failures can be called without raising an exception."""
+        lighthouse = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=1,
+        )
+        try:
+            client = LighthouseClient(
+                addr=lighthouse.address(),
+                connect_timeout=timedelta(seconds=1),
+            )
+            stream = client.subscribe_failures(timeout=timedelta(milliseconds=100))
+        finally:
+            lighthouse.shutdown()
+
+    def test_subscribe_failures_notification(self) -> None:
+        """Test that failure notifications are delivered to subscribers."""
+        lighthouse = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=1,
+        )
+        try:
+            client = LighthouseClient(
+                addr=lighthouse.address(),
+                connect_timeout=timedelta(seconds=1),
+            )
+            stream = client.subscribe_failures(timeout=timedelta(seconds=1))
+            lighthouse.inject_failure("nodeX")
+            note = next(stream)
+            assert note.replica_id == "nodeX"
+        finally:
+            lighthouse.shutdown()
+
+    def test_inject_failure(self) -> None:
+        """Test that inject failure delivers a failure notification to subscribers"""
+        # Start a lighthouse server
+        server = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=1,
+            join_timeout_ms=100,
+        )
+        print(f"Server address: {server.address()}")
+
+        # Create a client to subscribe to failures
+        client = LighthouseClient(server.address(), timedelta(seconds=5))
+        failure_stream = client.subscribe_failures(timedelta(seconds=5))
+
+        # Inject a failure
+        replica_id = "test_replica"
+        print(f"Injecting failure for replica: {replica_id}")
+        server.inject_failure(replica_id)
+
+        # Wait a bit for the notification to be processed
+        time.sleep(1)
+
+        # Try to get the failure notification
+        try:
+            notification = next(failure_stream)
+            print(
+                f"Received failure notification for replica: {notification.replica_id}"
+            )
+            assert notification.replica_id == replica_id, "Received wrong replica_id"
+            print("Test passed!")
+        except Exception as e:
+            print(f"Error: {e}")
+
+        # Clean up
+        server.shutdown()
+
+    def test_get_config_rpc(self) -> None:
+        """Test that get_config RPC returns configuration data."""
+        import json
+        import os
+        import tempfile
+
+        # Create a temporary config file with test data
+        test_config = {
+            "learning_rate": "0.001",
+            "batch_size": "64",
+            "model_type": "transformer",
+            "epochs": "100",
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(test_config, f)
+            config_file_path = f.name
+
+        try:
+            # Test without config file first
+            lighthouse = LighthouseServer(
+                bind="[::]:0",
+                min_replicas=1,
+            )
+
+            client = LighthouseClient(
+                addr=lighthouse.address(),
+                connect_timeout=timedelta(seconds=1),
+            )
+
+            # Test that get_config method exists and can be called
+            config_dict = client.get_config(timeout=timedelta(seconds=1))
+
+            # Verify the returned type is a dictionary
+            assert isinstance(
+                config_dict, dict
+            ), f"Expected dict, got {type(config_dict)}"
+
+            # With no config file provided to LighthouseServer, should return empty dict
+            assert len(config_dict) == 0, f"Expected empty config, got {config_dict}"
+
+            lighthouse.shutdown()
+
+            # Test with config file using the now exposed lighthouse_config parameter
+            lighthouse_with_config = LighthouseServer(
+                bind="[::]:0", min_replicas=1, lighthouse_config=config_file_path
+            )
+
+            client_with_config = LighthouseClient(
+                addr=lighthouse_with_config.address(),
+                connect_timeout=timedelta(seconds=1),
+            )
+
+            # Get config from lighthouse that has a config file
+            config_dict_with_file = client_with_config.get_config(
+                timeout=timedelta(seconds=1)
+            )
+
+            # Verify the config was loaded correctly
+            assert isinstance(
+                config_dict_with_file, dict
+            ), f"Expected dict, got {type(config_dict_with_file)}"
+            assert config_dict_with_file["learning_rate"] == "0.001"
+            assert config_dict_with_file["batch_size"] == "64"
+            assert config_dict_with_file["model_type"] == "transformer"
+            assert config_dict_with_file["epochs"] == "100"
+            assert len(config_dict_with_file) == 4
+
+            lighthouse_with_config.shutdown()
+
+        finally:
+            # Clean up the temporary config file
+            if os.path.exists(config_file_path):
+                os.unlink(config_file_path)

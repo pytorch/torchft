@@ -52,7 +52,12 @@
 
 <header>
   <h1>Lighthouse Dashboard - torchft</h1>
-  <img src="https://pytorch.org/assets/images/logo.svg" width="128"/>
+  <div>
+    <a href="/config" style="color: white; text-decoration: none; padding: 8px 16px; background-color: #6c757d; border-radius: 4px; margin-right: 10px;">
+      ⚙️ Config
+    </a>
+    <img src="https://pytorch.org/assets/images/logo.svg" width="128"/>
+  </div>
 </header>
 
 <section hx-get="/status" hx-trigger="load, every 1s">

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Configuration - Lighthouse Dashboard</title>
+  <link rel="shortcut icon" type="image/x-icon" href="https://pytorch.org/favicon.ico">
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji";
+      font-size: 1rem;
+      font-weight: 400;
+      line-height: 1.5;
+      color: #212529;
+      text-align: left;
+      background-color: #fff;
+    }
+    h1, h2, h3, h4, h5, h6, .h1, .h2, .h3, .h4, .h5, .h6 {
+      margin-bottom: .5rem;
+      font-weight: 500;
+      line-height: 1.2;
+    }
+    header {
+      background-color: rgba(0, 0, 0, 0.17);
+      padding: 10px;
+      display: flex;
+      align-items: center;
+      padding: 16px;
+      justify-content: space-between;
+    }
+    header h1 {
+      display: inline-block;
+      margin: 0;
+    }
+    section {
+      max-width: 1280px;
+      padding: 16px;
+      margin: 0 auto;
+    }
+    .config-display {
+      background-color: #f8f9fa;
+      border: 1px solid #dee2e6;
+      border-radius: 4px;
+      padding: 15px;
+      margin-bottom: 20px;
+    }
+    .config-display h3 {
+      margin-top: 0;
+      color: #495057;
+    }
+    .current-config-content {
+      background-color: #fff;
+      border: 1px solid #ced4da;
+      border-radius: 4px;
+      padding: 10px;
+      font-family: monospace;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow-y: auto;
+      color: #495057;
+    }
+    .timestamp {
+      font-size: 0.85rem;
+      color: #6c757d;
+      margin-bottom: 10px;
+    }
+    .config-editor {
+      background-color: #f8f9fa;
+      border: 1px solid #dee2e6;
+      border-radius: 4px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .config-editor h3 {
+      margin-top: 0;
+      color: #495057;
+    }
+    .json-helper {
+      background-color: #d1ecf1;
+      border: 1px solid #bee5eb;
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 15px;
+      font-size: 0.9rem;
+      color: #0c5460;
+    }
+    .config-textarea {
+      width: 100%;
+      height: 300px;
+      border: 1px solid #ced4da;
+      border-radius: 4px;
+      padding: 10px;
+      font-family: monospace;
+      font-size: 0.9rem;
+      line-height: 1.4;
+      resize: vertical;
+      background-color: #fff;
+    }
+    .config-textarea:focus {
+      border-color: #80bdff;
+      outline: 0;
+      box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
+    }
+    .config-textarea.invalid {
+      border-color: #dc3545;
+    }
+    .actions {
+      margin-top: 15px;
+    }
+    .btn {
+      display: inline-block;
+      padding: 8px 16px;
+      margin-right: 10px;
+      font-size: 0.9rem;
+      font-weight: 400;
+      line-height: 1.5;
+      text-align: center;
+      text-decoration: none;
+      vertical-align: middle;
+      cursor: pointer;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      transition: color .15s ease-in-out,background-color .15s ease-in-out,border-color .15s ease-in-out,box-shadow .15s ease-in-out;
+    }
+    .btn-primary {
+      color: #fff;
+      background-color: #007bff;
+      border-color: #007bff;
+    }
+    .btn-primary:hover {
+      color: #fff;
+      background-color: #0069d9;
+      border-color: #0062cc;
+    }
+    .btn-secondary {
+      color: #fff;
+      background-color: #6c757d;
+      border-color: #6c757d;
+    }
+    .btn-secondary:hover {
+      color: #fff;
+      background-color: #5a6268;
+      border-color: #545b62;
+    }
+    .success-message {
+      background-color: #d4edda;
+      border: 1px solid #c3e6cb;
+      color: #155724;
+      padding: 12px 20px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+    }
+    .note {
+      background-color: #fff3cd;
+      border: 1px solid #ffeaa7;
+      color: #856404;
+      padding: 12px 20px;
+      border-radius: 4px;
+      margin-top: 20px;
+    }
+    .loading {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+  </style>
+  <script src="https://unpkg.com/htmx.org@2.0.3"></script>
+</head>
+<body>
+
+<header>
+  <h1>Configuration - Lighthouse Dashboard</h1>
+  <div>
+    <a href="/" style="color: white; text-decoration: none; padding: 8px 16px; background-color: #6c757d; border-radius: 4px; margin-right: 10px;">
+      🏠 Dashboard
+    </a>
+    <img src="https://pytorch.org/assets/images/logo.svg" width="128"/>
+  </div>
+</header>
+
+<section>
+  <h2>Configuration</h2>
+
+  {% match success_message %}
+  {% when Some with (message) %}
+  <div class="success-message">
+    <strong>✓ Success:</strong> {{message}}
+  </div>
+  {% when None %}
+  {% endmatch %}
+
+  <div class="config-display">
+    <h3>Current Configuration</h3>
+    <div class="timestamp">Last updated: {{timestamp}}</div>
+    <div class="current-config-content">{{config_data}}</div>
+  </div>
+
+  <div class="config-editor">
+    <h3>Update Configuration</h3>
+    <div class="json-helper">
+      <strong>Enter your configuration as JSON ("{key: value}"). The format will be automatically validated and formatted as you type.</strong>
+    </div>
+    
+    <form hx-put="/config" hx-target="body" onsubmit="showLoading(this)">
+      <textarea 
+        name="config" 
+        class="config-textarea"
+        placeholder='{
+  "learning_rate": 0.001,
+  "batch_size": 32,
+  "epochs": 100,
+  "model_type": "transformer",
+  "use_gpu": true
+}'
+        oninput="formatJSON(this)"
+      >{{config_data}}</textarea>
+      
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">
+          Update Configuration
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="resetConfig()">
+          Reset
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="note">
+    <strong>Note:</strong> Configuration changes will be applied immediately to the lighthouse state. 
+    The interface will automatically validate JSON syntax and provide helpful error messages.
+  </div>
+</section>
+
+<script>
+// Auto-format JSON as user types (with debounce)
+let formatTimeout;
+function formatJSON(textarea) {
+  clearTimeout(formatTimeout);
+  formatTimeout = setTimeout(() => {
+    try {
+      const value = textarea.value.trim();
+      if (value && value !== '{}') {
+        const parsed = JSON.parse(value);
+        const formatted = JSON.stringify(parsed, null, 2);
+        if (formatted !== value) {
+          const cursorPos = textarea.selectionStart;
+          textarea.value = formatted;
+          // maintain cursor position
+          textarea.setSelectionRange(cursorPos, cursorPos);
+        }
+      }
+      textarea.classList.remove('invalid');
+    } catch (e) {
+      // Invalid JSON
+      textarea.classList.add('invalid');
+    }
+  }, 1000); // 1 second debounce
+}
+
+// Reset configuration to current state
+function resetConfig() {
+  const textarea = document.querySelector('.config-textarea');
+  textarea.value = `{{config_data}}`;
+  textarea.classList.remove('invalid');
+}
+
+// Show loading state during submission
+function showLoading(form) {
+  form.classList.add('loading');
+  return true;
+}
+
+// Auto-focus textarea when page loads
+document.addEventListener('DOMContentLoaded', function() {
+  const textarea = document.querySelector('.config-textarea');
+  if (textarea) {
+    setTimeout(() => {
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }, 200);
+  }
+});
+
+// Remove loading state if form submission completes
+document.addEventListener('htmx:afterRequest', function() {
+  document.querySelectorAll('.loading').forEach(el => {
+    el.classList.remove('loading');
+  });
+});
+</script>
+
+</body>
+</html>

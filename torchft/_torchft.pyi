@@ -11,8 +11,8 @@ class ManagerClient:
         checkpoint_metadata: str,
         shrink_only: bool,
         timeout: timedelta,
-        commit_failures: int,
         init_sync: bool = True,
+        commit_failures: int = 0,
     ) -> QuorumResult: ...
     def _checkpoint_metadata(self, rank: int, timeout: timedelta) -> str: ...
     def should_commit(
@@ -60,9 +60,12 @@ class LighthouseServer:
         join_timeout_ms: Optional[int] = None,
         quorum_tick_ms: Optional[int] = None,
         heartbeat_timeout_ms: Optional[int] = None,
+        failure_tick_ms: Optional[int] = None,
     ) -> None: ...
     def address(self) -> str: ...
     def shutdown(self) -> None: ...
+    def inject_failure(self, replica_id: str) -> None: ...
+    def get_config(self, timeout: timedelta) -> dict[str, str]: ...
 
 @dataclass
 class QuorumMember:
@@ -86,6 +89,14 @@ class Quorum:
     created: Timestamp
 
 @dataclass
+class FailureNotification:
+    replica_id: str
+
+class FailureStream:
+    def __iter__(self) -> "FailureStream": ...
+    def __next__(self) -> FailureNotification: ...
+
+@dataclass
 class LighthouseClient:
     addr: str
     connect_timeout: timedelta
@@ -106,3 +117,7 @@ class LighthouseClient:
         replica_id: str,
         timeout: timedelta = timedelta(seconds=5),
     ) -> None: ...
+    def subscribe_failures(
+        self,
+        timeout: timedelta = timedelta(seconds=5),
+    ) -> FailureStream: ...
