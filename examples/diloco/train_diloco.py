@@ -9,27 +9,23 @@ import os
 import sys
 from datetime import timedelta
 
-REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
-os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
-os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
+import os
+import sys
+import time
 
 import torch
-import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch import nn, optim
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from torchft import (
-    DistributedDataParallel,
-    DistributedSampler,
-    Manager,
-    Optimizer,
-    ProcessGroupGloo,
-    ProcessGroupNCCL,
-)
+from torchft import DistributedSampler, Manager, ProcessGroupGloo, ProcessGroupNCCL
 from torchft.checkpointing.pg_transport import PGTransport
+from torchft.local_sgd import DiLoCo
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
+from utils import get_cifar10_dataset
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,12 +34,17 @@ logging.basicConfig(level=logging.INFO)
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
     NUM_REPLICA_GROUPS = int(os.environ.get("NUM_REPLICA_GROUPS", 2))
+    QUICK_RUN = bool(os.environ.get("QUICK_RUN", False))
 
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     )
-    trainset = torchvision.datasets.CIFAR10(
-        root="./cifar", train=True, download=True, transform=transform
+    trainset = get_cifar10_dataset(
+        root="./cifar",
+        train=True,
+        download=True,
+        transform=transform,
+        quick_run=QUICK_RUN,
     )
 
     # This shards the training set across all ranks and replica groups. We manage
@@ -65,16 +66,6 @@ def main() -> None:
         trainset, batch_size=64, num_workers=2, sampler=sampler
     )
 
-    def load_state_dict(state_dict):
-        m.load_state_dict(state_dict["model"])
-        optimizer.load_state_dict(state_dict["optim"])
-
-    def state_dict():
-        return {
-            "model": m.state_dict(),
-            "optim": optimizer.state_dict(),
-        }
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pg = (
         ProcessGroupNCCL(
@@ -88,16 +79,6 @@ def main() -> None:
         pg,
         timeout=timedelta(seconds=10),
         device=("cuda" if torch.cuda.is_available() else "cpu"),
-    )
-
-    manager = Manager(
-        pg=pg,
-        min_replica_size=1,
-        load_state_dict=load_state_dict,
-        state_dict=state_dict,
-        replica_id=f"train_ddp_{REPLICA_GROUP_ID}",
-        timeout=timedelta(seconds=30),
-        checkpoint_transport=transport,
     )
 
     class Net(nn.Module):
@@ -135,13 +116,45 @@ def main() -> None:
             return x
 
     m = Net().to(device)
-    m = DistributedDataParallel(manager, m)
-    optimizer = Optimizer(manager, optim.AdamW(m.parameters()))
+    inner_optimizer = optim.AdamW(
+        m.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
+    )
+    outer_optimizer = optim.SGD(m.parameters(), lr=0.7, momentum=0.9, nesterov=True)
     criterion = nn.CrossEntropyLoss()
+
+    def load_state_dict(state_dict):
+        m.load_state_dict(state_dict["model"])
+        m.to(device)
+        diloco.original_parameters = state_dict["original_params"]
+        for name in diloco.original_parameters.keys():
+            diloco.original_parameters[name] = diloco.original_parameters[name].to(
+                device
+            )
+        inner_optimizer.load_state_dict(state_dict["inner_optim"])
+        outer_optimizer.load_state_dict(state_dict["outer_optim"])
+
+    def state_dict():
+        return {
+            "model": m.state_dict(),
+            "original_params": diloco.original_parameters,
+            "inner_optim": inner_optimizer.state_dict(),
+            "outer_optim": outer_optimizer.state_dict(),
+        }
+
+    manager = Manager(
+        pg=pg,
+        min_replica_size=1,
+        load_state_dict=load_state_dict,
+        state_dict=state_dict,
+        replica_id=f"train_ddp_{REPLICA_GROUP_ID}",
+        timeout=timedelta(seconds=30),
+        checkpoint_transport=transport,
+        use_async_quorum=False,
+    )
 
     print(m)
     num_params = sum(p.numel() for p in m.parameters())
-    print(f"Total number of parameters: {num_params}")
+    print(f"DiLoCo: Total number of parameters: {num_params}")
 
     sort_by_keyword = "self_" + device + "_time_total"
 
@@ -163,43 +176,64 @@ def main() -> None:
     )
 
     prof.start()
-    while True:
-        for i, (inputs, labels) in enumerate(trainloader):
-            prof.step()
 
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+    num_local_steps = 0
+    sync_every = 5 if QUICK_RUN else 100
+    with DiLoCo(
+        manager,
+        m,
+        inner_optimizer,
+        outer_optimizer,
+        backup_device=device,
+        sync_every=sync_every,
+    ) as diloco:
+        while True:
+            for i, (inputs, labels) in enumerate(trainloader):
+                prof.step()
 
-            # must be called at the beginning of each train loop
-            # Quorum computation is triggered here but only needed in the backwards pass.
-            optimizer.zero_grad()
+                inputs = inputs.to(device)
+                labels = labels.to(device)
 
-            out = m(inputs)
-            loss = criterion(out, labels)
+                # must be called at the beginning of each train loop
+                # Quorum computation is triggered here but only needed in the backwards pass.
+                inner_optimizer.zero_grad()
 
-            # Gradient allreduce overlaps with the backwards pass.
-            loss.backward()
+                out = m(inputs)
+                loss = criterion(out, labels)
 
-            # must be called at the end of the train loop
-            # This may not actually step the optimizer if an error occured during grad allreduce.
-            optimizer.step()
+                # Gradient allreduce overlaps with the backwards pass.
+                loss.backward()
 
-            if manager.current_step() % 100 == 0:
-                print(f"[{manager.current_step()}] loss = {loss.item()}")
+                # must be called at the end of the train loop
+                # This may not actually step the optimizer if an error occured during grad allreduce.
+                inner_optimizer.step()
+                num_local_steps += 1
 
-            # TODO (by the user): periodically checkpoint model, optim, manager and dataloader
+                if num_local_steps % sync_every == 0:
+                    print(
+                        f"DiLoCo: Number of inner optimizer steps completed: {num_local_steps}"
+                    )
+                    print(
+                        f"DiLoCo: Number of outer optimizer steps completed: {manager.current_step()} loss = {loss.item()}"
+                    )
 
-            # You typically want to checkpoint dataloader frequently (every step?) to
-            # avoid repeated batches as it's replica group specific.
+                # TODO (by the user): periodically checkpoint model, optim, manager and dataloader
 
-            # Model, optim and manager checkpoints can be done more infrequently as
-            # they're shared across all groups and will load from existing replicas as
-            # long as not every worker goes down.
+                # You typically want to checkpoint dataloader frequently (every step?) to
+                # avoid repeated batches as it's replica group specific.
 
-            if manager.current_step() >= 10000:
-                # complete training
-                prof.stop()
-                exit()
+                # Model, optim and manager checkpoints can be done more infrequently as
+                # they're shared across all groups and will load from existing replicas as
+                # long as not every worker goes down.
+
+                max_steps = 3 if QUICK_RUN else 10000
+                if manager.current_step() >= max_steps:
+                    # complete training
+                    prof.stop()
+                    exit()
+
+                sleep_time = 0.001 if QUICK_RUN else 0.01
+                time.sleep(sleep_time)
 
 
 if __name__ == "__main__":

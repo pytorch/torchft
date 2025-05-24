@@ -222,7 +222,7 @@ class DiLoCo:
                 p = extract_local_tensor(p.data)
 
             backup_device = self._backup_device or torch.device("cpu")
-            t = torch.empty(*tuple(p.shape), dtype=p.dtype, device=backup_device)
+            t: torch.Tensor = torch.empty(*tuple(p.shape), dtype=p.dtype, device=backup_device)
             if (
                 self._pin_memory
                 and t.device == torch.device("cpu")

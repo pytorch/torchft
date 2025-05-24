@@ -79,15 +79,14 @@ We have a minimal DDP train loop that highlights all of the key components in to
 
 See [train_ddp.py](./train_ddp.py) for more info.
 
+### Advanced Examples
 
-### DiLoCo
+See the [examples/README.md](./examples/README.md) for advanced examples. Currently, the following examples are available:
 
-LocalSGD and DiLoCo are currently experimental.
-
-See
-[the diloco_train_loop/local_sgd_train_loop tests](./torchft/local_sgd_integ_test.py)
-for an example on how to integrate these algorithms into your training loop.
-
+- [DDP with proactive failure recovery](./examples/ddp_proactive/README.md): Demonstrates DDP with proactive failure recovery mode
+- [DiLoCo](./examples/diloco/README.md): Demonstrates Distributed Local Convergence training
+- [LocalSGD](./examples/localsgd/README.md): Demonstrates Local SGD with periodic synchronization
+- [Live Checkpoint Recovery](./examples/live_checkpoint_recovery/README.md): Demonstrates live checkpoint recovery
 
 ## Design
 

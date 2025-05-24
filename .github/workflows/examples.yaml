@@ -1,0 +1,58 @@
+name: Examples
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  unittest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: "linux.2xlarge"
+            gpu-arch-type: "cpu"
+            gpu-arch-version: ""
+            torch-version: "stable"
+          - runs-on: "linux.g5.12xlarge.nvidia.gpu"
+            gpu-arch-type: "cuda"
+            gpu-arch-version: "12.4"
+            torch-version: "stable"
+          - runs-on: "linux.g5.12xlarge.nvidia.gpu"
+            gpu-arch-type: "cuda"
+            gpu-arch-version: "12.4"
+            torch-version: "nightly"
+
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 120
+      runner: ${{ matrix.runs-on }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      script: |
+        set -ex
+
+        # install python and protobuf
+        conda create -n venv python=3.12 libprotobuf -y
+        conda activate venv
+        python -m pip install --upgrade pip
+
+        # install recent version of Rust via rustup
+        curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=stable --profile=default -y
+        . "$HOME/.cargo/env"
+
+        # Optionally install torch nightly, pulls latest CUDA from pip otherwise
+        if [ "${{ matrix.torch-version }}" = "nightly" ]; then
+          pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+        fi
+        if [ "${{ matrix.torch-version }}" = "test" ]; then
+          pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
+        fi
+
+        # Install dependencies
+        pip install -e .[dev] -v
+
+        # Run tests
+        pytest examples/test_examples.py

@@ -67,9 +67,17 @@ message LighthouseHeartbeatRequest {
 
 message LighthouseHeartbeatResponse {}
 
+message SubscribeFailuresRequest {}
+
+message FailureNotification {
+    string replica_id = 1;
+    string error_message = 2;
+}
+
 service LighthouseService {
     rpc Quorum (LighthouseQuorumRequest) returns (LighthouseQuorumResponse);
     rpc Heartbeat (LighthouseHeartbeatRequest) returns (LighthouseHeartbeatResponse);
+    rpc SubscribeFailures (SubscribeFailuresRequest) returns (stream FailureNotification);
 }
 
 message ManagerQuorumRequest {
@@ -126,3 +134,9 @@ service ManagerService {
     rpc ShouldCommit(ShouldCommitRequest) returns (ShouldCommitResponse);
     rpc Kill(KillRequest) returns (KillResponse);
 }
+
+message LighthouseClientRequest {
+    string replica_id = 1;
+}
+
+

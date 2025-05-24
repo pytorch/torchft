@@ -7,11 +7,8 @@
 import logging
 import os
 import sys
+import time
 from datetime import timedelta
-
-REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
-os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
-os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +28,9 @@ from torchft import (
 )
 from torchft.checkpointing.pg_transport import PGTransport
 
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
+from utils import get_cifar10_dataset
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -38,12 +38,17 @@ logging.basicConfig(level=logging.INFO)
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
     NUM_REPLICA_GROUPS = int(os.environ.get("NUM_REPLICA_GROUPS", 2))
+    QUICK_RUN = bool(os.environ.get("QUICK_RUN", False))
 
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     )
-    trainset = torchvision.datasets.CIFAR10(
-        root="./cifar", train=True, download=True, transform=transform
+    trainset = get_cifar10_dataset(
+        root="./cifar",
+        train=True,
+        download=True,
+        transform=transform,
+        quick_run=QUICK_RUN,
     )
 
     # This shards the training set across all ranks and replica groups. We manage
@@ -78,10 +83,10 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pg = (
         ProcessGroupNCCL(
-            timeout=timedelta(seconds=30),
+            timeout=timedelta(seconds=120),
         )
         if torch.cuda.is_available()
-        else ProcessGroupGloo(timeout=timedelta(seconds=5))
+        else ProcessGroupGloo(timeout=timedelta(seconds=120))
     )
 
     transport = PGTransport(
@@ -137,7 +142,6 @@ def main() -> None:
     m = Net().to(device)
     m = DistributedDataParallel(manager, m)
     optimizer = Optimizer(manager, optim.AdamW(m.parameters()))
-    criterion = nn.CrossEntropyLoss()
 
     print(m)
     num_params = sum(p.numel() for p in m.parameters())
@@ -175,10 +179,21 @@ def main() -> None:
             optimizer.zero_grad()
 
             out = m(inputs)
+            criterion = nn.CrossEntropyLoss()
             loss = criterion(out, labels)
 
             # Gradient allreduce overlaps with the backwards pass.
             loss.backward()
+            if manager.current_step() == 3:
+                if REPLICA_GROUP_ID == 0:
+                    manager.shutdown()
+                    exit(0)
+                # If proactive recovery, then the surviving process will reconfigure
+                # If not proactive recovery, then the surviving process will wait until timeout
+
+            test_tensor = torch.tensor([1.0]).to(device)
+            print("DEBUG: manager.current_step()", manager.current_step(), "STARTING HANGING ALLREDUCE", "world_size", manager._participating_replica_world_size, "rank", manager._participating_replica_rank)
+            manager.allreduce(test_tensor)
 
             # must be called at the end of the train loop
             # This may not actually step the optimizer if an error occured during grad allreduce.
@@ -196,10 +211,14 @@ def main() -> None:
             # they're shared across all groups and will load from existing replicas as
             # long as not every worker goes down.
 
-            if manager.current_step() >= 10000:
+            max_steps = 10 if QUICK_RUN else 10000
+            if manager.current_step() >= max_steps:
                 # complete training
                 prof.stop()
                 exit()
+
+            sleep_time = 0.001 if QUICK_RUN else 0.5
+            time.sleep(sleep_time)
 
 
 if __name__ == "__main__":

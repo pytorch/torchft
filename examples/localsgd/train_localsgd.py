@@ -9,9 +9,7 @@ import os
 import sys
 from datetime import timedelta
 
-REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
-os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
-os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
+import time
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +28,10 @@ from torchft import (
     ProcessGroupNCCL,
 )
 from torchft.checkpointing.pg_transport import PGTransport
+from torchft.local_sgd import LocalSGD
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
+from utils import get_cifar10_dataset
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,12 +40,17 @@ logging.basicConfig(level=logging.INFO)
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
     NUM_REPLICA_GROUPS = int(os.environ.get("NUM_REPLICA_GROUPS", 2))
+    QUICK_RUN = bool(os.environ.get("QUICK_RUN", False))
 
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     )
-    trainset = torchvision.datasets.CIFAR10(
-        root="./cifar", train=True, download=True, transform=transform
+    trainset = get_cifar10_dataset(
+        root="./cifar",
+        train=True,
+        download=True,
+        transform=transform,
+        quick_run=QUICK_RUN,
     )
 
     # This shards the training set across all ranks and replica groups. We manage
@@ -83,6 +90,7 @@ def main() -> None:
         if torch.cuda.is_available()
         else ProcessGroupGloo(timeout=timedelta(seconds=5))
     )
+    print(f"LocalSGD: Process group: {pg}")
 
     transport = PGTransport(
         pg,
@@ -135,13 +143,12 @@ def main() -> None:
             return x
 
     m = Net().to(device)
-    m = DistributedDataParallel(manager, m)
-    optimizer = Optimizer(manager, optim.AdamW(m.parameters()))
+    optimizer = optim.Adam(m.parameters())
     criterion = nn.CrossEntropyLoss()
 
     print(m)
     num_params = sum(p.numel() for p in m.parameters())
-    print(f"Total number of parameters: {num_params}")
+    print(f"LocalSGD: Total number of parameters: {num_params}")
 
     sort_by_keyword = "self_" + device + "_time_total"
 
@@ -163,43 +170,57 @@ def main() -> None:
     )
 
     prof.start()
-    while True:
-        for i, (inputs, labels) in enumerate(trainloader):
-            prof.step()
 
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+    num_local_steps = 0
+    sync_every = 5 if QUICK_RUN else 100
+    with LocalSGD(manager, m, optimizer, sync_every=sync_every):
+        while True:
+            for i, (inputs, labels) in enumerate(trainloader):
+                prof.step()
 
-            # must be called at the beginning of each train loop
-            # Quorum computation is triggered here but only needed in the backwards pass.
-            optimizer.zero_grad()
+                inputs = inputs.to(device)
+                labels = labels.to(device)
 
-            out = m(inputs)
-            loss = criterion(out, labels)
+                # must be called at the beginning of each train loop
+                # Quorum computation is triggered here but only needed in the backwards pass.
+                optimizer.zero_grad()
 
-            # Gradient allreduce overlaps with the backwards pass.
-            loss.backward()
+                out = m(inputs)
+                loss = criterion(out, labels)
 
-            # must be called at the end of the train loop
-            # This may not actually step the optimizer if an error occured during grad allreduce.
-            optimizer.step()
+                # Gradient allreduce overlaps with the backwards pass.
+                loss.backward()
 
-            if manager.current_step() % 100 == 0:
-                print(f"[{manager.current_step()}] loss = {loss.item()}")
+                # must be called at the end of the train loop
+                # This may not actually step the optimizer if an error occured during grad allreduce.
+                optimizer.step()
+                num_local_steps += 1
 
-            # TODO (by the user): periodically checkpoint model, optim, manager and dataloader
+                if manager.current_step() % 100 == 0:
+                    print(f"LocalSGD: [{manager.current_step()}] loss = {loss.item()}")
 
-            # You typically want to checkpoint dataloader frequently (every step?) to
-            # avoid repeated batches as it's replica group specific.
+                if num_local_steps % 100 == 0:
+                    print(
+                        f"LocalSGD: Number of local optimizer steps completed: {num_local_steps}"
+                    )
 
-            # Model, optim and manager checkpoints can be done more infrequently as
-            # they're shared across all groups and will load from existing replicas as
-            # long as not every worker goes down.
+                # TODO (by the user): periodically checkpoint model, optim, manager and dataloader
 
-            if manager.current_step() >= 10000:
-                # complete training
-                prof.stop()
-                exit()
+                # You typically want to checkpoint dataloader frequently (every step?) to
+                # avoid repeated batches as it's replica group specific.
+
+                # Model, optim and manager checkpoints can be done more infrequently as
+                # they're shared across all groups and will load from existing replicas as
+                # long as not every worker goes down.
+
+                max_steps = 3 if QUICK_RUN else 10000
+                if manager.current_step() >= max_steps:
+                    # complete training
+                    prof.stop()
+                    exit()
+
+                sleep_time = 0.001 if QUICK_RUN else 0.01
+                time.sleep(sleep_time)
 
 
 if __name__ == "__main__":
