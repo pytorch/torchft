@@ -7,6 +7,7 @@
 import logging
 import os
 import sys
+import time
 from datetime import timedelta
 
 REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
@@ -137,7 +138,6 @@ def main() -> None:
     m = Net().to(device)
     m = DistributedDataParallel(manager, m)
     optimizer = Optimizer(manager, optim.AdamW(m.parameters()))
-    criterion = nn.CrossEntropyLoss()
 
     print(m)
     num_params = sum(p.numel() for p in m.parameters())
@@ -167,6 +167,8 @@ def main() -> None:
         for i, (inputs, labels) in enumerate(trainloader):
             prof.step()
 
+            time.sleep(0.5)  # Else each iteration runs too quickly
+
             inputs = inputs.to(device)
             labels = labels.to(device)
 
@@ -175,10 +177,20 @@ def main() -> None:
             optimizer.zero_grad()
 
             out = m(inputs)
+            criterion = nn.CrossEntropyLoss()
             loss = criterion(out, labels)
 
             # Gradient allreduce overlaps with the backwards pass.
             loss.backward()
+            if manager.current_step() == 3:
+                if REPLICA_GROUP_ID == 0:
+                    manager.shutdown()
+                    exit(0)
+                # If proactive recovery, then the surviving process will reconfigure
+                # If not proactive recovery, then the surviving process will wait until timeout
+
+            test_tensor = torch.tensor([1.0]).to(device)
+            manager.allreduce(test_tensor)
 
             # must be called at the end of the train loop
             # This may not actually step the optimizer if an error occured during grad allreduce.

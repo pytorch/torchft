@@ -5,18 +5,34 @@
 # LICENSE file in the root directory of this source tree.
 
 import concurrent
+import multiprocessing
+import time
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 from unittest import TestCase
 from unittest.mock import MagicMock, create_autospec, patch
 
 import torch
+import torch.distributed as dist
 from torch.distributed import TCPStore
 
-from torchft._torchft import QuorumResult
+from torchft._torchft import (
+    FailureStream,
+    LighthouseClient,
+    LighthouseServer,
+    QuorumResult,
+)
 from torchft.checkpointing.transport import CheckpointTransport
-from torchft.manager import MANAGER_ADDR_KEY, REPLICA_ID_KEY, Manager, WorldSizeMode
-from torchft.process_group import ProcessGroup, _DummyWork
+from torchft.manager import (
+    MANAGER_ADDR_KEY,
+    REPLICA_ID_KEY,
+    ExceptionWithTraceback,
+    Manager,
+    WorldSizeMode,
+    _failure_listener_process_main,
+)
+from torchft.process_group import ProcessGroup, ProcessGroupGloo, _DummyWork
 
 
 def mock_should_commit(
@@ -43,6 +59,7 @@ class TestManager(TestCase):
         timeout: timedelta = timedelta(seconds=10),
         init_sync: bool = True,
         max_retries: Optional[int] = None,
+        proactive_recovery: bool = False,
     ) -> Manager:
         pg = create_autospec(ProcessGroup)
         pg.errored.return_value = None
@@ -72,6 +89,7 @@ class TestManager(TestCase):
                 timeout=timeout,
                 init_sync=init_sync,
                 max_retries=max_retries,
+                proactive_recovery=proactive_recovery,
             )
             self.manager = manager
         return manager
@@ -773,3 +791,127 @@ class TestManager(TestCase):
         # This should succeed and reset the counter
         self.assertTrue(manager.should_commit())
         self.assertEqual(manager._commit_failures, 0)
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_manager_error_handler(self, client_mock: MagicMock) -> None:
+        """Test that the Manager correctly processes exceptions sent from the failure_listener_process."""
+        # Create a manager
+        manager = self._create_manager()
+
+        # Create an exception simulating what would be sent from _failure_listener_process_main
+        error = Exception("Peer failure detected: replica failed_replica has failed")
+        exception = ExceptionWithTraceback(error)
+
+        # Directly test the error handling mechanism
+        manager._error_handler(error)
+
+        # Verify the error was properly processed
+        captured_error = manager.errored()
+        self.assertIsNotNone(captured_error)
+        self.assertEqual(str(captured_error.original_exception), str(error))
+
+    def test_direct_error_pipe(self) -> None:
+        """Test sending an exception to the Manager's _error_pipe."""
+        # Create a manager with proactive_recovery=True to ensure it has an error pipe
+        lighthouse = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=1,
+            join_timeout_ms=100,
+        )
+
+        # Create a manager that tries to join
+        store = dist.TCPStore(
+            host_name="localhost",
+            port=0,
+            is_master=True,
+            wait_for_workers=False,
+        )
+        pg = ProcessGroupGloo()
+        manager = Manager(
+            pg=pg,
+            min_replica_size=1,
+            load_state_dict=lambda x: None,
+            state_dict=lambda: None,
+            replica_id=f"lighthouse_test",
+            store_addr="localhost",
+            store_port=store.port,
+            rank=0,
+            world_size=1,
+            use_async_quorum=False,
+            lighthouse_addr=lighthouse.address(),
+            proactive_recovery=True,
+        )
+
+        # Make sure the error pipe is created
+        self.assertIsNotNone(manager._error_pipe, "Manager should have an error pipe")
+        time.sleep(1)
+        # Create a mock error message
+        mock_error_msg = "Test failure detected from direct pipe test"
+        test_exception = Exception(mock_error_msg)
+
+        # Create an ExceptionWithTraceback and send it through the pipe
+        exc_with_tb = ExceptionWithTraceback(test_exception)
+        manager._error_remote.send(exc_with_tb)
+
+        # Wait a short time for the error processor thread to process the message
+        time.sleep(1)
+
+        # Verify that the error was properly processed by the Manager
+        error_obj = manager.errored()
+        self.assertIsNotNone(
+            error_obj, "Error should have been captured by the Manager"
+        )
+
+        # Clean up
+        manager.shutdown(wait=True)
+
+    def test_manager_failure_e2e(self) -> None:
+        """Test that the Manager correctly handles errors from the failure_listener_process."""
+        # Create a manager with proactive_recovery=True to ensure it has an error pipe
+        lighthouse = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=1,
+            join_timeout_ms=100,
+        )
+
+        # Create a manager that tries to join
+        store = dist.TCPStore(
+            host_name="localhost",
+            port=0,
+            is_master=True,
+            wait_for_workers=False,
+        )
+        pg = ProcessGroupGloo()
+        manager = Manager(
+            pg=pg,
+            min_replica_size=1,
+            load_state_dict=lambda x: None,
+            state_dict=lambda: None,
+            replica_id=f"lighthouse_test",
+            store_addr="localhost",
+            store_port=store.port,
+            rank=0,
+            world_size=1,
+            use_async_quorum=False,
+            lighthouse_addr=lighthouse.address(),
+            proactive_recovery=True,
+        )
+
+        time.sleep(1.5)
+
+        failed_replica_id = "failed_replica"
+        lighthouse.inject_failure(failed_replica_id)
+
+        time.sleep(1.5)  # Prevent flakyness
+        error_obj = manager.errored()
+
+        # Verify that the manager received the error notification
+        self.assertIsNotNone(error_obj, "Manager should have captured the failure")
+        self.assertIn(
+            failed_replica_id,
+            str(error_obj.original_exception),
+            f"Error should mention the failed replica: {error_obj.original_exception}",
+        )
+
+        # Clean up resources
+        manager.shutdown(wait=True)
