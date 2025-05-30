@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import TYPE_CHECKING
+
 import torch
 
 # pyre-ignore[21]: Could not find a module corresponding to import `triton`
@@ -17,7 +19,9 @@ from torch.distributed.distributed_c10d import (
 )
 from torch.futures import Future
 
-from torchft.process_group import ProcessGroup
+if TYPE_CHECKING:
+    from torchft.process_group import ProcessGroup
+
 from torchft.quantization import (
     fused_dequantize_from_fp8,
     fused_quantize_into_fp8,
@@ -40,7 +44,7 @@ def _to_allgather_options(opts: AllreduceOptions) -> AllgatherOptions:
 def allreduce_quantized(
     tensors: list[torch.Tensor],
     opts: AllreduceOptions | ReduceOp,
-    process_group: ProcessGroup,
+    process_group: "ProcessGroup",
     sync_stream: cuda.Stream | None = None,
 ) -> Future[None]:
     """

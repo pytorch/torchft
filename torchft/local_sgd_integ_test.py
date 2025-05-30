@@ -118,10 +118,10 @@ def diloco_train_loop(
         def load_state_dict(state_dict: Dict[str, Dict[str, object]]) -> None:
             m.load_state_dict(state_dict["model"])
             m.to(device)
-            diloco.original_parameters = state_dict["original_params"]
-            for name in diloco.original_parameters.keys():
-                diloco.original_parameters[name] = diloco.original_parameters[name].to(
-                    device
+            diloco._fragments[0].original_parameters = state_dict["original_params"]
+            for name in diloco._fragments[0].original_parameters.keys():
+                diloco._fragments[0].original_parameters[name] = (
+                    diloco._fragments[0].original_parameters[name].to(device)
                 )
             inner_optimizer.load_state_dict(state_dict["inner_optim"])
             outer_optimizer.load_state_dict(state_dict["outer_optim"])
@@ -129,7 +129,7 @@ def diloco_train_loop(
         def state_dict() -> Dict[str, Dict[str, object]]:  # pyre-ignore[53]
             return {
                 "model": m.state_dict(),
-                "original_params": diloco.original_parameters,
+                "original_params": diloco._fragments[0].original_parameters,
                 "inner_optim": inner_optimizer.state_dict(),
                 "outer_optim": outer_optimizer.state_dict(),
             }
@@ -195,7 +195,7 @@ def diloco_train_loop(
         all_state_dicts = {}
         with DiLoCo(
             manager,
-            m,
+            [m],
             inner_optimizer,
             outer_optimizer,
             backup_device=device,

@@ -35,13 +35,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar, cast
 
 import torch
 from torch.distributed import ReduceOp, TCPStore
 
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
+from torchft.collectives import allreduce_quantized
 from torchft.futures import future_timeout
 
 if TYPE_CHECKING:
@@ -267,7 +268,9 @@ class Manager:
             self._manager.shutdown()
         self._executor.shutdown(wait=wait)
 
-    def allreduce(self, tensor: torch.Tensor) -> torch.futures.Future[torch.Tensor]:
+    def allreduce(
+        self, tensor: torch.Tensor, should_quantize: bool = False
+    ) -> torch.futures.Future[torch.Tensor]:
         """
         Fault tolerant allreduce the tensor and return a Future that will be completed when
         the tensor is ready.
@@ -299,8 +302,12 @@ class Manager:
         try:
             # Run the allreduce async and save the work object so we can wait on
             # it later.
-            work = self._pg.allreduce([tensor], ReduceOp.SUM)
-            fut = work.get_future()
+            fut: torch.futures.Future[Any] = None
+            if should_quantize:
+                fut = allreduce_quantized([tensor], ReduceOp.AVG, self._pg)
+            else:
+                work = self._pg.allreduce([tensor], ReduceOp.SUM)
+                fut = work.get_future()
 
             # schedule grad normalization as a continuation
             # on the Future
@@ -312,7 +319,8 @@ class Manager:
                 # check for exceptions
                 fut.value()
 
-                tensor /= self.num_participants()
+                if not should_quantize:
+                    tensor /= self.num_participants()
 
                 return tensor
 

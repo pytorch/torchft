@@ -120,20 +120,22 @@ class DiLoCoTest(TestCase):
         manager = create_autospec(Manager)
         manager._use_async_quorum = False
         with DiLoCo(
-            manager, model, inner_optimizer, outer_optimizer, sync_every=2
+            manager, [model], inner_optimizer, outer_optimizer, sync_every=2
         ) as diloco:
             parameter_count = len(list(model.parameters()))
             initial_outer_opt_state = outer_optimizer.state_dict()
             self.assertEqual(initial_outer_opt_state["state"], {})
 
-            self.assertEqual(diloco._local_step, 0)
-            torch.testing.assert_close(diloco.original_parameters, _params_dict(model))
+            self.assertEqual(diloco._fragments[0]._local_step, 0)
+            torch.testing.assert_close(
+                diloco._fragments[0].original_parameters, _params_dict(model)
+            )
             inp = torch.rand(2, 3)
             loss = model(inp).mean()
             loss.backward()
             inner_optimizer.step()
 
-            self.assertEqual(diloco._local_step, 1)
+            self.assertEqual(diloco._fragments[0]._local_step, 1)
             self.assertEqual(manager.start_quorum.call_count, 0)
             loss = model(inp).mean()
             loss.backward()
@@ -141,8 +143,10 @@ class DiLoCoTest(TestCase):
             self.assertEqual(manager.start_quorum.call_count, 1)
 
             manager.should_commit.return_value = True
-            self.assertEqual(diloco._local_step, 0)
-            torch.testing.assert_close(diloco.original_parameters, _params_dict(model))
+            self.assertEqual(diloco._fragments[0]._local_step, 2)
+            torch.testing.assert_close(
+                diloco._fragments[0].original_parameters, _params_dict(model)
+            )
             self.assertEqual(manager.should_commit.call_count, 1)
             self.assertEqual(manager.allreduce.call_count, parameter_count)
 
@@ -176,7 +180,7 @@ class DiLoCoTest(TestCase):
 
         with DiLoCo(
             manager,
-            model,
+            [model],
             inner_optimizer,
             outer_optimizer,
             sync_every=2,
@@ -223,19 +227,19 @@ class DiLoCoTest(TestCase):
         manager.should_commit.return_value = True
 
         # Define fake allreduce: multiplies buffer by 2
-        def fake_allreduce(tensor: Tensor) -> MagicMock:
+        def fake_allreduce(tensor: Tensor, should_quantize: bool) -> MagicMock:
             tensor.mul_(2)
             return MagicMock(wait=lambda: None)
 
         manager.allreduce.side_effect = fake_allreduce
 
         diloco = DiLoCo(
-            manager, model, inner_opt, outer_opt, sync_every=2, use_bucketization=True
+            manager, [model], inner_opt, outer_opt, sync_every=2, use_bucketization=True
         )
-        diloco.bucket_cap_mb = 10 * 1024 * 1024
+        diloco._fragments[0].bucket_cap_mb = 10 * 1024 * 1024
 
         # Run only bucketized logic
-        diloco._average_grads()
+        diloco._fragments[0]._average_grads()
 
         # Expect grads to have been doubled
         expected_grads = [g * 2 for g in grads]
