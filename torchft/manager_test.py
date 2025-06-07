@@ -164,9 +164,7 @@ class TestManager(TestCase):
 
         manager.start_quorum()
         manager.allreduce(torch.tensor([1.0])).wait()
-        self.assertEqual(len(manager._pending_work), 1)
         self.assertTrue(manager.should_commit())
-        self.assertEqual(len(manager._pending_work), 0)
 
         self.assertEqual(manager._quorum_id, 123)
         self.assertEqual(manager.current_step(), 1)
@@ -554,8 +552,6 @@ class TestManager(TestCase):
         self.assertIs(error.original_exception, e)
         self.assertEqual(wrapped_fut.value(), 2)
 
-        self.assertEqual(manager._pending_work, [wrapped_fut])
-
     @patch("torchft.manager.ManagerClient", autospec=True)
     def test_manager_wrap_future_timeout(self, client_mock: MagicMock) -> None:
         manager = self._create_manager(timeout=timedelta(seconds=0.01))
@@ -590,18 +586,16 @@ class TestManager(TestCase):
         manager._pg.allreduce.return_value = _DummyWork(None)
 
         self.assertTrue(manager.is_participating())
-        fut = torch.futures.Future()  # pyre-fixme[29]: not a function
-        fut = manager.allreduce(torch.tensor([1.0]))
-        result = fut.value()
-        torch.testing.assert_close(result, torch.tensor([1.0 / 5]))
+        tensor = torch.tensor([1.0])
+        manager.allreduce(tensor).wait()
+        torch.testing.assert_close(tensor, torch.tensor([1.0 / 5]))
 
         # check healing numerics
         manager._healing = True
         self.assertFalse(manager.is_participating())
-        fut = torch.futures.Future()  # pyre-fixme[29]: not a function
-        fut = manager.allreduce(torch.tensor([1.0]))
-        result = fut.value()
-        torch.testing.assert_close(result, torch.tensor([0.0]))
+        tensor = torch.tensor([1.0])
+        manager.allreduce(tensor).wait()
+        torch.testing.assert_close(tensor, torch.tensor([0.0]))
 
     @patch("torchft.manager.ManagerClient", autospec=True)
     def test_quorum_happy_timeouts(self, client_mock: MagicMock) -> None:

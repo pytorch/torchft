@@ -68,7 +68,15 @@ class DistributedDataParallel(parallel.DistributedDataParallel):
     def _comm_hook(
         state: "Manager", bucket: dist.GradBucket
     ) -> torch.futures.Future[torch.Tensor]:
-        return state.allreduce(bucket.buffer())
+        work = state.allreduce(bucket.buffer())
+        fut = work.get_future()
+
+        def callback(fut: torch.futures.Future[None]) -> torch.Tensor:
+            nonlocal bucket
+            return bucket.buffer()
+
+        fut = fut.then(callback)
+        return fut
 
 
 class PureDistributedDataParallel(nn.Module):

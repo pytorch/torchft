@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type
 import torch
 import torch.distributed as dist
 from torch import nn, optim
+from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
 from torch.nn.parameter import Parameter
 from torch.optim.optimizer import Optimizer
@@ -197,9 +198,7 @@ class _StreamingDiLoCoFragment:
         self._outer_optimizer = outer_optimizer
 
         # Stores pending all reduce
-        self._allreduce_futures: list[
-            torch.futures.Future[None] | torch.futures.Future[torch.Tensor]
-        ] = []
+        self._allreduce_futures: list[Work] = []
 
         if bucket_cap_mb is not None:
             self.bucket_cap_mb = int(bucket_cap_mb * 1024 * 1024)
@@ -272,6 +271,7 @@ class _StreamingDiLoCoFragment:
         step_to_sync = step - self._fragment_sync_offset - self._fragment_sync_delay
         return step_to_sync % self._sync_every == 0
 
+    @torch.profiler.record_function("torchft::local_sgd::prepare_sync")
     def prepare_sync(self) -> None:
         """
         Calculate the pseugradient, average them across the manager group and starts
@@ -288,6 +288,7 @@ class _StreamingDiLoCoFragment:
 
         self._average_grads()
 
+    @torch.profiler.record_function("torchft::local_sgd::perform_sync")
     def perform_sync(self) -> bool:
         """
         Overrides the sync method to wait for the scheduled allreduce to finish and
@@ -467,16 +468,6 @@ class DiLoCo:
         if fragment_update_alpha < 0 or fragment_update_alpha > 1:
             raise ValueError("fragment_update_alpha must be between 0 and 1")
 
-        # TODO: Support multiple fragments
-        # This requires changing the manager to support `should_commit` for each
-        # fragment separately.
-        if len(model_fragments) != 1:
-            raise ValueError("Multiple fragments are not supported yet")
-
-        # TODO: Support `fragment_sync_delay`
-        if fragment_sync_delay != 0:
-            raise ValueError("Fragment synchronization delay is not supported yet")
-
         # TODO: Support `fragment_update_alpha`
         if fragment_update_alpha != 0.0:
             raise ValueError(
@@ -522,6 +513,8 @@ class DiLoCo:
                 use_bucketization,
                 bucket_cap_mb,
                 should_quantize,
+                fragment_sync_delay,
+                fragment_update_alpha,
             )
             for i, model_fragment in enumerate(model_fragments)
         ]
@@ -606,15 +599,19 @@ class DiLoCo:
             step = self._local_step
 
         # Start sending fragments
-        for fragment in self._fragments:
+        for i, fragment in enumerate(self._fragments):
             if not fragment.should_prepare_fragment(step):
                 continue
 
+            logger.info(f"preparing fragment {i} at step {step}")
+
             fragment.prepare_sync()
 
-        for fragment in self._fragments:
+        for i, fragment in enumerate(self._fragments):
             if not fragment.should_sync_fragment(step):
                 continue
+
+            logger.info(f"syncing fragment {i} at step {step}")
 
             if not fragment.perform_sync():
                 # Cancel all the previously scheduled allreduce by simply

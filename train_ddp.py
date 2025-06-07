@@ -51,7 +51,7 @@ def main() -> None:
     # majority of groups will be available so few batches will be dropped.
     sampler = DistributedSampler(
         trainset,
-        replica_group=REPLICA_GROUP_ID,
+        replica_rank=REPLICA_GROUP_ID,
         num_replica_groups=NUM_REPLICA_GROUPS,
         group_rank=0,
         # for DDP we can use replica groups of size 1, FSDP/PP/CP would need more.

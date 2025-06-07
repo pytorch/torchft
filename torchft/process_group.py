@@ -69,6 +69,7 @@ from torch.utils._pytree import tree_any
 from torchft.device_mesh import *  # noqa: F401
 from torchft.futures import context_timeout, stream_timeout
 from torchft.multiprocessing import _MonitoredPipe
+from torchft.work import DummyWork
 
 if TYPE_CHECKING:
     from torchft.manager import Manager
@@ -775,7 +776,7 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
 
     def errored(self) -> Optional[Exception]:
         # force a synchronization to ensure all work is complete
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
 
         return self._errored
 
@@ -783,19 +784,7 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         return "torchft-nccl"
 
 
-class _DummyWork(dist._Work):
-    def __init__(self, result: object) -> None:
-        super().__init__()
-        self.result_ = result
-        # pyre-fixme[29]: Future is not a function
-        self.future_: torch.futures.Future[object] = torch.futures.Future()
-        self.future_.set_result(result)
-
-    def wait(self, timeout: Optional[timedelta] = None) -> bool:
-        return True
-
-    def get_future(self) -> torch.futures.Future[object]:
-        return self.future_
+_DummyWork = DummyWork
 
 
 class ProcessGroupDummy(ProcessGroup):
