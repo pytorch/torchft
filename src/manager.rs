@@ -544,13 +544,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_commit() -> Result<()> {
-        let lighthouse = Lighthouse::new(LighthouseOpt {
-            bind: "[::]:0".to_string(),
-            join_timeout_ms: 100,
-            min_replicas: 1,
-            quorum_tick_ms: 100,
-            heartbeat_timeout_ms: 5000,
-        })
+        let lighthouse = Lighthouse::new(
+            "".to_string(),
+            LighthouseOpt {
+                bind: "[::]:0".to_string(),
+                join_timeout_ms: 100,
+                min_replicas: 1,
+                quorum_tick_ms: 100,
+                heartbeat_timeout_ms: 5000,
+            },
+        )
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
 
@@ -591,13 +594,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_quorum() -> Result<()> {
-        let lighthouse = Lighthouse::new(LighthouseOpt {
-            bind: "[::]:0".to_string(),
-            join_timeout_ms: 100,
-            min_replicas: 1,
-            quorum_tick_ms: 100,
-            heartbeat_timeout_ms: 5000,
-        })
+        let lighthouse = Lighthouse::new(
+            "".to_string(),
+            LighthouseOpt {
+                bind: "[::]:0".to_string(),
+                join_timeout_ms: 100,
+                min_replicas: 1,
+                quorum_tick_ms: 100,
+                heartbeat_timeout_ms: 5000,
+            },
+        )
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
 
@@ -646,13 +652,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_quorum_heal_first_step() -> Result<()> {
-        let lighthouse = Lighthouse::new(LighthouseOpt {
-            bind: "[::]:0".to_string(),
-            join_timeout_ms: 100,
-            min_replicas: 2,
-            quorum_tick_ms: 100,
-            heartbeat_timeout_ms: 5000,
-        })
+        let lighthouse = Lighthouse::new(
+            "".to_string(),
+            LighthouseOpt {
+                bind: "[::]:0".to_string(),
+                join_timeout_ms: 100,
+                min_replicas: 2,
+                quorum_tick_ms: 100,
+                heartbeat_timeout_ms: 5000,
+            },
+        )
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
 
@@ -718,13 +727,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_checkpoint_metadata() -> Result<()> {
-        let lighthouse = Lighthouse::new(LighthouseOpt {
-            bind: "[::]:0".to_string(),
-            join_timeout_ms: 100,
-            min_replicas: 1,
-            quorum_tick_ms: 100,
-            heartbeat_timeout_ms: 5000,
-        })
+        let lighthouse = Lighthouse::new(
+            "".to_string(),
+            LighthouseOpt {
+                bind: "[::]:0".to_string(),
+                join_timeout_ms: 100,
+                min_replicas: 1,
+                quorum_tick_ms: 100,
+                heartbeat_timeout_ms: 5000,
+            },
+        )
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
 
