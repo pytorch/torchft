@@ -213,7 +213,13 @@ class _StreamingDiLoCoFragment:
         self.should_quantize = should_quantize
 
         self._grads: Dict[str, torch.Tensor] = {}
+
+        # Used to save global parameters so that they can be restored in case
+        # commit fails
         self.original_parameters: Dict[str, torch.Tensor] = {}
+
+        # Used to mix the local and global parameters
+        self._local_parameters: Dict[str, torch.Tensor] = {}
 
         for name, p in self._model_fragment.named_parameters():
             if isinstance(p, DTensor):
@@ -240,21 +246,22 @@ class _StreamingDiLoCoFragment:
     @torch.profiler.record_function("torchft::local_sgd::restore_parameters")
     def restore_parameters(self) -> None:
         with torch.no_grad():
+            assert len(self._local_parameters) == 0
             # TODO: consider running copy on a separate stream
             for name, p in self._model_fragment.named_parameters():
+                self._local_parameters[name] = p.data
+
                 if isinstance(p, DTensor):
                     # we averaged the local version of the tensor so need to copy it back as a DTensor
-                    p.data.copy_(
-                        DTensor.from_local(
-                            self.original_parameters[name],
-                            p.device_mesh,
-                            p.placements,
-                            shape=p.shape,
-                            stride=p.stride(),
-                        ),
-                        non_blocking=False,
+                    p.data = DTensor.from_local(
+                        self.original_parameters[name],
+                        p.device_mesh,
+                        p.placements,
+                        shape=p.shape,
+                        stride=p.stride(),
                     )
                 else:
+                    p.data = torch.empty_like(self.original_parameters[name])
                     p.data.copy_(self.original_parameters[name], non_blocking=False)
 
     def _set_grads(self) -> None:
@@ -268,6 +275,18 @@ class _StreamingDiLoCoFragment:
                 p.grad = self._grads[name]
 
             del self._grads[name]
+
+    def _merge_parameters(self) -> None:
+        """
+        Merges the local and global parameters.
+        """
+        for name, p in self._model_fragment.named_parameters():
+            torch.lerp(
+                p.data, self._local_parameters[name], 1 - self._fragment_update_alpha
+            )
+
+        # we don't need the local parameters anymore
+        self._local_parameters = {}
 
     @torch.profiler.record_function("torchft::local_sgd::wait")
     def wait(self) -> None:
@@ -313,6 +332,8 @@ class _StreamingDiLoCoFragment:
             else:
                 self._grads[name] = pseudogradient
 
+        assert len(self._allreduce_futures) == 0
+
         # Make sure tensors are available to `_stream`
         if self._stream is not None:
             self._stream.wait_stream(torch.cuda.current_stream())
@@ -352,6 +373,7 @@ class _StreamingDiLoCoFragment:
             self._set_grads()
             self._outer_optimizer.step()
             self.save_parameters()
+            self._merge_parameters()
         self._outer_optimizer.zero_grad()
 
         return should_commit
@@ -511,12 +533,6 @@ class DiLoCo:
 
         if fragment_update_alpha < 0 or fragment_update_alpha > 1:
             raise ValueError("fragment_update_alpha must be between 0 and 1")
-
-        # TODO: Support `fragment_update_alpha`
-        if fragment_update_alpha != 0.0:
-            raise ValueError(
-                "Merging local parameters with global parameters is not supported yet"
-            )
 
         super().__init__()
         self._manager = manager
