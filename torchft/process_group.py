@@ -611,6 +611,114 @@ class ProcessGroupGloo(ProcessGroupWrapper):
         )
 
 
+class _ParallelWork(Work):
+    def __init__(self, works: List[Work]) -> None:
+        super().__init__()
+        self._works = works
+
+    def wait(self, timeout: Optional[timedelta] = None) -> bool:
+        for work in self._works:
+            if timeout is not None:
+                work.wait(timeout=timeout)
+            else:
+                work.wait()
+        return True
+
+    def get_future(self) -> torch.futures.Future[object]:
+        futures = [work.get_future() for work in self._works]
+        return torch.futures.collect_all(futures)
+
+
+class ParallelProcessGroup(ProcessGroupWrapper):
+    def __init__(
+        self,
+        base: ProcessGroupWrapper,
+        timeout: timedelta = timedelta(seconds=60),
+        count: int = 10,
+    ) -> None:
+        super().__init__(timeout=timeout)
+
+        self._base = base
+        self._count = count
+        self._pgs = []
+
+        self._create_pg = base._create_pg
+
+    def configure(self, store_addr: str, rank: int, world_size: int) -> None:
+        # abort if already initialized
+        self.abort()
+
+        self._pgs = []
+
+        for i in range(self._count):
+            store = create_store_client(
+                f"{store_addr}/parallel{i}", timeout=self._timeout
+            )
+
+            self._pgs.append(self._create_pg(store, rank, world_size))
+
+        self._pg = self._pgs[0]
+
+    def getBackendName(self) -> str:
+        return f"{self._base.getBackendName()}-parallel"
+
+    def _split_tensors(self, tensors: List[torch.Tensor]) -> List[List[torch.Tensor]]:
+        if not isinstance(tensors, (list, tuple)):
+            tensors = [tensors]
+
+        tensor_lists = [[] for _ in range(self._count)]
+        for t in tensors:
+            chunks = torch.tensor_split(t.view(-1), self._count, dim=0)
+            for i, chunk in enumerate(chunks):
+                tensor_lists[i].append(chunk)
+
+        return tensor_lists
+
+    def allreduce(self, tensors: List[torch.Tensor], opts: object) -> Work:
+        tensor_lists = self._split_tensors(tensors)
+
+        with self._run_context():
+            works = []
+            for i in range(self._count):
+                works.append(
+                    self._pgs[i].allreduce(tensor_lists[i], self._opts_hook(opts))
+                )
+
+            return self._wrap_work(_ParallelWork(works), opts)
+
+    def reduce(self, tensors: List[torch.Tensor], dst: int, opts: object) -> Work:
+        tensor_lists = self._split_tensors(tensors)
+
+        with self._run_context():
+            works = []
+            for i in range(self._count):
+                works.append(
+                    self._pgs[i].reduce(tensor_lists[i], dst, self._opts_hook(opts))
+                )
+
+            return self._wrap_work(_ParallelWork(works), opts)
+
+    def send(self, tensors: List[torch.Tensor], dst_rank: int, tag: int) -> Work:
+        tensor_lists = self._split_tensors(tensors)
+
+        with self._run_context():
+            works = []
+            for i in range(self._count):
+                works.append(self._pgs[i].send(tensor_lists[i], dst_rank, tag))
+
+            return self._wrap_work(_ParallelWork(works), None)
+
+    def recv(self, tensors: List[torch.Tensor], src_rank: int, tag: int) -> Work:
+        tensor_lists = self._split_tensors(tensors)
+
+        with self._run_context():
+            works = []
+            for i in range(self._count):
+                works.append(self._pgs[i].recv(tensor_lists[i], src_rank, tag))
+
+            return self._wrap_work(_ParallelWork(works), None)
+
+
 class _WorkCUDATimeout(Work):
     def __init__(self, pg: ProcessGroup, work: Work, timeout: timedelta) -> None:
         super().__init__()
