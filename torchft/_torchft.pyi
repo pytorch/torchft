@@ -89,6 +89,7 @@ class Quorum:
 class LighthouseClient:
     addr: str
     connect_timeout: timedelta
+    room_id: Optional[str] = None
 
     def quorum(
         self,
