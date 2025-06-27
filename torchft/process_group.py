@@ -378,6 +378,13 @@ class ProcessGroupWrapper(ProcessGroup):
         self._pg: Optional[BaseProcessGroup] = pg
         self._timeout = timeout
 
+    def getBackendName(self) -> str:
+        pg = self._pg
+        if isinstance(pg, ProcessGroup):
+            return pg.getBackendName()
+
+        raise NotImplementedError("not implemented")
+
     def configure(self, store_addr: str, rank: int, world_size: int) -> None:
         pg = self._pg
         if isinstance(pg, ProcessGroup):
@@ -1014,6 +1021,55 @@ class ErrorSwallowingProcessGroupWrapper(ProcessGroupWrapper):
         except Exception as e:
             self.report_error(e)
             return _DummyWork(tensors)
+
+
+class FakeProcessGroupWrapper(ProcessGroupWrapper):
+    """
+    This is a wrapper around any ProcessGroup that can be used to inject
+    errors into the process group at various points.
+
+    This is intended to be used for tests so that they can test cases
+    in which process group operations error out.
+    """
+
+    def __init__(self, pg: ProcessGroup) -> None:
+        super().__init__(pg=pg)
+
+        self._future_error: Optional[Exception] = None
+
+    def configure(self, store_addr: str, rank: int, world_size: int) -> None:
+        self._future_error = None
+
+        super().configure(store_addr, rank, world_size)
+
+    def report_future_error(self, e: Exception) -> None:
+        """
+        Report an error to this process group. This will cause the
+        future attached to the next operation to error out.
+
+        Args:
+            e: exception to report
+        """
+        self._future_error = e
+
+    def allreduce(self, tensors: List[torch.Tensor], opts: object) -> Work:
+        work = super().allreduce(tensors, opts)
+
+        if self._future_error is None:
+            return work
+
+        fut = work.get_future()
+
+        def callback(
+            fut: torch.futures.Future[List[torch.Tensor]],
+        ) -> List[torch.Tensor]:
+            future_error, self._future_error = self._future_error, None
+            assert future_error is not None
+            raise future_error
+
+        fut = fut.then(callback)
+
+        return work
 
 
 class _ManagedWork(Work):

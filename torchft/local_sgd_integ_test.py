@@ -28,7 +28,11 @@ from torchft.manager_integ_test import (
     MyModel,
     Runner,
 )
-from torchft.process_group import ProcessGroupBabyNCCL, ProcessGroupGloo
+from torchft.process_group import (
+    FakeProcessGroupWrapper,
+    ProcessGroupBabyNCCL,
+    ProcessGroupGloo,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -188,9 +192,11 @@ def diloco_train_loop(
         print(f"worker {runner.replica_id=} {rank=} {runner.world_size=} starting")
 
         if device.type == "cuda":
-            pg = ProcessGroupBabyNCCL()
+            pg = FakeProcessGroupWrapper(ProcessGroupBabyNCCL())
         else:
-            pg = ProcessGroupGloo(timeout=timedelta(seconds=10))
+            pg = FakeProcessGroupWrapper(
+                ProcessGroupGloo(timeout=timedelta(seconds=10))
+            )
         manager = Manager(
             pg=pg,
             min_replica_size=2,
@@ -210,6 +216,7 @@ def diloco_train_loop(
             # pyre-fixme[6]: Incompatible parameter type
             **runner.manager_args,
         )
+        runner.event_injector.set_pg(pg)
         stack.callback(manager.shutdown)
         # initialize default group for device mesh to work
         if not torch.distributed.is_initialized():
@@ -669,3 +676,78 @@ class LocalSGDIntegTest(TestCase):
 
         for event_injector in event_injectors:
             self.assertEqual(event_injectors[1].count[EventInjectorEvent.Barrier], 1)
+
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    @skipIf(sys.platform == "darwin", "not reliable on mac")
+    @parameterized.expand(CONFIG)
+    def test_streaming_diloco_commit_failure(
+        self, use_cuda: bool, n_fragments: int, fragment_sync_delay: int
+    ) -> None:
+        # Skip the test if use_cuda is True and there are not enough GPUs
+        if use_cuda and torch.cuda.device_count() < 2:
+            self.skipTest("Not enough GPUs for CUDA test")
+
+        lighthouse = LighthouseServer(
+            bind="[::]:0",
+            min_replicas=2,
+        )
+        num_replicas = 2
+        futures = []
+        executors = []
+
+        event_injectors = [
+            EventInjector().fail_allreduce_at(0, 1),
+            EventInjector().fail_allreduce_at(0, 1),
+        ]
+
+        torch.manual_seed(42)
+        # Initialize the model so we can pass in the state_dict
+        m: nn.Module = MultiMyModel(2, 3, n_fragments)
+
+        for replica_id, event_injector in zip(range(num_replicas), event_injectors):
+            executor = ThreadPoolExecutor(max_workers=1)
+            executors.append(executor)
+            runner = Runner(
+                replica_id=replica_id,
+                num_replicas=num_replicas,
+                lighthouse_address=lighthouse.address(),
+                event_injector=event_injector,
+                train_loop=diloco_train_loop,
+                train_loop_args={
+                    "model_state_dict": m.state_dict(),
+                    "n_fragments": n_fragments,
+                    "diloco_args": {
+                        "fragment_sync_delay": fragment_sync_delay,
+                        "sync_every": 4,
+                    },
+                },
+            )
+            futures.append(executor.submit(runner.run_replica))
+
+        state_dicts = []
+
+        for fut in as_completed(futures):
+            continue
+
+        for fut in futures:
+            try:
+                state_dicts.append(fut.result()[0])
+            except Exception as e:
+                print(e)
+                raise
+
+        lighthouse.shutdown()
+
+        rep0, rep1 = state_dicts
+
+        assert_equal_global_state(rep0, rep1)
+
+        for step in rep0.keys():
+            self.assertEqual(
+                rep0[step]["user"]["local_step"], rep1[step]["user"]["local_step"]
+            )
+
+        for event_injector in event_injectors:
+            self.assertEqual(
+                event_injector.count[EventInjectorEvent.AllreduceFailure], 1
+            )
