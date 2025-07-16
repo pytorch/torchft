@@ -71,6 +71,7 @@ fn num_threads() -> usize {
 ///     world_size (int): The world size of the replica group.
 ///     heartbeat_interval (timedelta): The interval at which heartbeats are sent.
 ///     connect_timeout (timedelta): The timeout for connecting to the lighthouse server.
+///     quorum_retries (int): The number of retries for quorum requests to lighthouse server.
 #[pyclass]
 struct ManagerServer {
     handle: JoinHandle<Result<()>>,
@@ -91,6 +92,7 @@ impl ManagerServer {
         world_size: u64,
         heartbeat_interval: Duration,
         connect_timeout: Duration,
+        quorum_retries: i64,
     ) -> PyResult<Self> {
         py.allow_threads(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -108,6 +110,7 @@ impl ManagerServer {
                     world_size,
                     heartbeat_interval,
                     connect_timeout,
+                    quorum_retries,
                 ))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let handle = runtime.spawn(manager.clone().run());
