@@ -58,6 +58,7 @@ struct State {
 }
 
 pub struct Lighthouse {
+    id: String,
     state: Mutex<State>,
     opt: LighthouseOpt,
     listener: Mutex<Option<tokio::net::TcpListener>>,
@@ -83,7 +84,7 @@ impl ChangeLogger {
     }
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt, Debug, Clone)]
 #[structopt()]
 pub struct LighthouseOpt {
     // bind is the address to bind the server to.
@@ -261,12 +262,13 @@ fn quorum_compute(
 }
 
 impl Lighthouse {
-    pub async fn new(opt: LighthouseOpt) -> Result<Arc<Self>> {
+    pub async fn new(id: String, opt: LighthouseOpt) -> Result<Arc<Self>> {
         let listener = tokio::net::TcpListener::bind(&opt.bind).await?;
 
         let (tx, _) = broadcast::channel(16);
 
         Ok(Arc::new(Self {
+            id: id,
             state: Mutex::new(State {
                 participants: HashMap::new(),
                 channel: tx,
@@ -975,7 +977,7 @@ mod tests {
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
         };
-        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse = Lighthouse::new("".to_string(), opt).await?;
 
         let lighthouse_task = tokio::spawn(lighthouse.clone().run());
 
@@ -1133,7 +1135,7 @@ mod tests {
         };
 
         // Start the lighthouse service
-        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse = Lighthouse::new("".to_string(), opt).await?;
         let lighthouse_task = tokio::spawn(lighthouse.clone().run());
 
         // Create client to interact with lighthouse
@@ -1240,7 +1242,7 @@ mod tests {
         };
 
         // Start the lighthouse service
-        let lighthouse = Lighthouse::new(opt).await?;
+        let lighthouse = Lighthouse::new("".to_string(), opt).await?;
         let lighthouse_task = tokio::spawn(lighthouse.clone().run());
 
         // Create client to interact with lighthouse
