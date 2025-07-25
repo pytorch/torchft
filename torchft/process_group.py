@@ -767,6 +767,9 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         # pyre-fixme[16]: no attribute ProcessGroupNCCL
         backend_class = BaseProcessGroupNCCL(store, rank, world_size, opts)
         backend_class._set_sequence_number_for_group()
+        backend_class.eager_connect_single_device(
+            torch.device(torch.accelerator.current_device_index())
+        )
         pg._register_backend(
             torch.device("cuda"), ProcessGroup.BackendType.NCCL, backend_class
         )
