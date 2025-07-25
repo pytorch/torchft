@@ -24,12 +24,12 @@ Issues = "https://github.com/pytorch-labs/torchft/issues"
 dev = [
     "pytest==8.3.4",
     "pytest-timeout",
-    "black",
-    "pyre-check",
     "parameterized",
     "expecttest",
     "numpy",
-    "torchx"
+    "torchx",
+    "lintrunner",
+    "lintrunner-adapters",
 ]
 
 [tool.maturin]
