@@ -68,7 +68,22 @@ class DistributedDataParallel(parallel.DistributedDataParallel):
     def _comm_hook(
         state: "Manager", bucket: dist.GradBucket
     ) -> torch.futures.Future[torch.Tensor]:
-        return state.allreduce(bucket.buffer())
+        tensor = bucket.buffer()
+        work = state.allreduce(tensor)
+        fut = work.get_future()
+
+        result = torch.futures.Future()  # pyre-fixme[29]: Future is not a function
+
+        def callback(
+            fut: torch.futures.Future[torch.Tensor],
+        ) -> None:
+            fut.wait()
+            fut.value()
+            result.set_result(tensor)
+
+        fut.add_done_callback(callback)
+
+        return result
 
 
 class PureDistributedDataParallel(nn.Module):

@@ -10,11 +10,13 @@ from unittest.mock import create_autospec
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.distributed_c10d import Work
 from torch.futures import Future
 
 from torchft.ddp import DistributedDataParallel, PureDistributedDataParallel
 from torchft.manager import Manager
 from torchft.process_group import ProcessGroupBabyGloo, ProcessGroupGloo
+from torchft.work import _DummyWork
 
 
 class TestDDP(TestCase):
@@ -39,14 +41,14 @@ class TestDDP(TestCase):
 
         call_count = 0
 
-        def allreduce(tensor: torch.Tensor) -> Future[torch.Tensor]:
+        def allreduce(
+            tensor: torch.Tensor,
+        ) -> Work:
             nonlocal call_count
 
             call_count += 1
 
-            fut = Future()  # pyre-fixme[29]: not a function
-            fut.set_result(tensor)
-            return fut
+            return _DummyWork(tensor)
 
         manager.allreduce = allreduce
 
