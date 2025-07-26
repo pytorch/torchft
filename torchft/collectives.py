@@ -387,6 +387,8 @@ def allreduce_quantized(
             nonlocal tensors, quantized_tensors, world_size, sync_stream
 
             with torch.cuda.stream(sync_stream):
+                # Setup stream dependency
+                fut.wait()
                 # Dequantize the result back to the original precision
                 fused_dequantize_from_fp8(tensors, quantized_tensors, world_size)
                 return tensors

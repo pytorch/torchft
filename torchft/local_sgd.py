@@ -513,9 +513,14 @@ class _StreamingDiLoCoFragment:
             )
 
             def callback(fut: torch.futures.Future[torch.Tensor]) -> None:
-                nonlocal bucket_tensors, flat_buffer
-                for t, pack_offset, numel in bucket_tensors:
-                    t.copy_(flat_buffer[pack_offset : pack_offset + numel].view_as(t))
+                with torch.cuda.stream(self._stream) if self._stream else nullcontext():
+                    nonlocal bucket_tensors, flat_buffer
+                    # Setup stream dependency
+                    fut.wait()
+                    for t, pack_offset, numel in bucket_tensors:
+                        t.copy_(
+                            flat_buffer[pack_offset : pack_offset + numel].view_as(t)
+                        )
 
             work = work.then(callback)
             self._allreduce_futures.append(work)

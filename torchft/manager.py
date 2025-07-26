@@ -26,6 +26,7 @@ and Hybrid FSDP.
 """
 
 import concurrent.futures
+import copy
 import logging
 import os
 import socket
@@ -403,6 +404,8 @@ class Manager:
                 # change the stream to avoid making the callback stream
                 # dependent on process group stream running the allreduce
                 with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                    # Setup stream dependency
+                    fut.wait()
                     fut.value()
                     tensor /= num_participants
 
@@ -646,7 +649,7 @@ class Manager:
                             self._checkpoint_transport.send_checkpoint(
                                 dst_ranks=quorum.recover_dst_replica_ranks,
                                 step=max_step,
-                                state_dict=self._manager_state_dict(),
+                                state_dict=copy.deepcopy(self._manager_state_dict()),
                                 timeout=self._timeout,
                             )
 
