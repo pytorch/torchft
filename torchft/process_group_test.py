@@ -47,12 +47,12 @@ from torchft.process_group import (
     ProcessGroupGloo,
     ProcessGroupNCCL,
     ProcessGroupWrapper,
-    _DummyWork,
     _ErrorSwallowingWork,
     _ManagedWork,
     extend_device_mesh,
     ft_init_device_mesh,
 )
+from torchft.work import _DummyWork
 
 
 def dummy_init_pg() -> None:

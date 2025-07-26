@@ -634,7 +634,7 @@ def all_reduce_callback(
 
         manager.start_quorum()
         t1 = torch.ones((1, 3), device=device)
-        fut = manager.allreduce(t1)
-        fut.wait()
+        work = manager.allreduce(t1)
+        work.get_future().wait()
         return t1
     return None
