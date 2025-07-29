@@ -40,6 +40,7 @@ from torchft.manager import Manager
 from torchft.process_group import (
     ErrorSwallowingProcessGroupWrapper,
     ManagedProcessGroup,
+    ParallelProcessGroup,
     ProcessGroup,
     ProcessGroupBabyGloo,
     ProcessGroupBabyNCCL,
@@ -689,6 +690,29 @@ class ProcessGroupTest(TestCase):
         t = torch.zeros(10)
         with self.assertRaisesRegex(OSError, "handle is closed"):
             a.allreduce([t], AllreduceOptions()).wait()
+
+    def test_parallel_gloo_apis(self) -> None:
+        dummy_init_pg()
+
+        store = TCPStore(
+            host_name="localhost", port=0, is_master=True, wait_for_workers=False
+        )
+
+        store_addr = f"localhost:{store.port}/prefix"
+
+        a = ParallelProcessGroup(
+            base=ProcessGroupGloo(),
+            count=4,
+        )
+        a.configure(store_addr, 0, 1)
+        a.register("test_parallel_gloo_apis")
+
+        _test_pg(
+            a,
+            skip=("reduce_scatter_tensor_coalesced"),
+        )
+
+        a.unregister()
 
     # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @skipUnless(torch.cuda.is_available(), "needs CUDA")
