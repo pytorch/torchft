@@ -48,7 +48,6 @@ from torchft.process_group import (
     ProcessGroupNCCL,
     ProcessGroupWrapper,
     _ErrorSwallowingWork,
-    _ManagedWork,
     extend_device_mesh,
     ft_init_device_mesh,
 )
@@ -810,11 +809,8 @@ class ProcessGroupTest(TestCase):
         self.assertEqual(pg.size(), 123)
 
         works = _test_pg(pg)
-        self.assertIsInstance(list(works.values())[0], _ManagedWork)
 
-        self.assertEqual(manager.report_error.call_count, 0)
-        self.assertEqual(manager.wrap_future.call_count, 2)
-        self.assertEqual(manager.wait_quorum.call_count, 2)
+        self.assertEqual(manager.allreduce.call_count, 2)
 
 
 class DeviceMeshTest(TestCase):
