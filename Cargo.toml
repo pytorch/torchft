@@ -9,8 +9,12 @@ askama = "0.12.1"
 atty = "0.2.14"
 axum = "0.7.7"
 chrono = "0.4.40"
+dashmap = "6.1"
 fern = {version = "0.7.1", features = ["colored"]}
+futures = "0.3"
 gethostname = "0.5.0"
+hyper = "0.14"
+http = "0.2"
 log = "0.4.22"
 prost = "0.13.3"
 prost-types = "0.13.3"
@@ -21,7 +25,9 @@ slog-stdlog = "4.1.1"
 stderrlog = "0.6.0"
 structopt = "0.3.26"
 tokio = {version = "1.40.0", features = ["full", "test-util", "tracing", "macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
 tonic = "0.12.2"
+tower = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12.2"
