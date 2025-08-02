@@ -36,6 +36,7 @@ from torchft.process_group import (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 def local_sgd_train_loop(
@@ -143,6 +144,7 @@ def assert_equal_global_state(
                 rep1[step]["user"][f"StreamingDiLoCoFragment_{i}"],
                 rep0[step]["user"][f"StreamingDiLoCoFragment_{i}"],
                 check_device=False,
+                msg=f"{step=} {i=}",
             )
         # Check all outer optimizers
         for i in range(
@@ -574,3 +576,9 @@ class LocalSGDIntegTest(TestCase):
             self.assertEqual(
                 event_injector.count[EventInjectorEvent.AllreduceFailure], 1
             )
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

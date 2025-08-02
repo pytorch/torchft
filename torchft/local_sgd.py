@@ -86,6 +86,9 @@ class LocalSGD:
         self._hooks: List[RemovableHandle] = []
 
     def __enter__(self) -> "LocalSGD":
+        self._hooks.append(
+            self._local_optimizer.register_step_pre_hook(self._step_pre_hook)
+        )
         # Add optimizer hook which increments the local step counter and syncs if necessary
         self._hooks.append(
             self._local_optimizer.register_step_post_hook(self._step_post_hook)
@@ -106,12 +109,20 @@ class LocalSGD:
 
         return False  # Propagate exceptions
 
+    def _step_pre_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        # The checkpoint may transfer model parameters, so we need to make access to it thread safe
+        self._manager.disallow_state_dict_read()
+
     def _step_post_hook(
         self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
     ) -> None:
         """
         This hook is registered on the optimizer and is called after the optimizer step.
         """
+        self._manager.allow_state_dict_read()
+
         self._local_step += 1
         if self._local_step >= self._sync_every:
             self.sync()
@@ -682,11 +693,20 @@ class DiLoCo:
             fragment.restore_parameters()
 
     def __enter__(self) -> "DiLoCo":
+        self._hooks.append(
+            self._local_optimizer.register_step_pre_hook(self._step_pre_hook)
+        )
         # Add optimizer hook which increments the local step counter and syncs if necessary
         self._hooks.append(
             self._local_optimizer.register_step_post_hook(self._step_post_hook)
         )
         return self
+
+    def _step_pre_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        # The checkpoint may transfer model parameters, so we need to make access to it thread safe
+        self._manager.disallow_state_dict_read()
 
     def __exit__(
         self,
@@ -722,6 +742,8 @@ class DiLoCo:
         """
         This hook is registered on the optimizer and is called after the optimizer step.
         """
+        self._manager.allow_state_dict_read()
+
         # We need to make sure all nodes send the same fragments in order.
         # This is to avoid deadlocking e.g.
         #
