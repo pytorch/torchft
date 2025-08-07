@@ -40,6 +40,7 @@ from torchft.process_group import (
     ProcessGroupGloo,
 )
 
+logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
 
 INIT_LOCK: threading.Lock = threading.Lock()
@@ -638,3 +639,9 @@ def all_reduce_callback(
         work.wait()
         return t1
     return None
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()
