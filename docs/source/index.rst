@@ -10,6 +10,7 @@ the entire training job.
 **GETTING STARTED?** See Install and Usage in `the README <https://github.com/pytorch/torchft>`_.
 
 .. toctree::
+    :glob:
     :maxdepth: 1
     :caption: Design
 
@@ -17,7 +18,8 @@ the entire training job.
     assumptions_and_recommendations
 
 .. toctree::
-    :maxdepth: 2
+    :glob:
+    :maxdepth: 1
     :caption: API Reference
 
     api
