@@ -10,8 +10,10 @@ from torchft.manager import Manager
 from torchft.optim import OptimizerWrapper as Optimizer
 from torchft.process_group import (
     ProcessGroupBabyNCCL,
+    ProcessGroupBabyXCCL,
     ProcessGroupGloo,
     ProcessGroupNCCL,
+    ProcessGroupXCCL,
 )
 
 __all__ = (
@@ -20,6 +22,8 @@ __all__ = (
     "Manager",
     "Optimizer",
     "ProcessGroupNCCL",
+    "ProcessGroupXCCL",
     "ProcessGroupBabyNCCL",
+    "ProcessGroupBabyXCCL",
     "ProcessGroupGloo",
 )

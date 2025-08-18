@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import argparse
 import logging
 import os
 import sys
@@ -12,6 +13,9 @@ from datetime import timedelta
 REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
 os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
 os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
+# Set XPU device visibility for Intel XPU devices
+if "XPU_VISIBLE_DEVICES" not in os.environ:
+    os.environ["XPU_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +32,7 @@ from torchft import (
     Optimizer,
     ProcessGroupGloo,
     ProcessGroupNCCL,
+    ProcessGroupXCCL,
 )
 from torchft.checkpointing.pg_transport import PGTransport
 
@@ -36,6 +41,17 @@ logging.basicConfig(level=logging.INFO)
 
 @record
 def main() -> None:
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='TorchFT DDP Training')
+    parser.add_argument(
+        "--enable-profiling",
+        type=lambda x: str(x).lower() in ["true", "1", "yes"],
+        default=True,
+        help="Enable or disable PyTorch profiling (True/False)",
+    )
+
+    args = parser.parse_args()
+
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
     NUM_REPLICA_GROUPS = int(os.environ.get("NUM_REPLICA_GROUPS", 2))
 
@@ -75,19 +91,20 @@ def main() -> None:
             "optim": optimizer.state_dict(),
         }
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    pg = (
-        ProcessGroupNCCL(
-            timeout=timedelta(seconds=30),
-        )
-        if torch.cuda.is_available()
-        else ProcessGroupGloo(timeout=timedelta(seconds=5))
-    )
+    if torch.cuda.is_available():
+        device = "cuda"
+        pg = ProcessGroupNCCL(timeout=timedelta(seconds=30))
+    elif torch.xpu.is_available():
+        device = "xpu"
+        pg = ProcessGroupXCCL(timeout=timedelta(seconds=30))
+    else:
+        device = "cpu"
+        pg = ProcessGroupGloo(timeout=timedelta(seconds=5))
 
     transport = PGTransport(
         pg,
         timeout=timedelta(seconds=10),
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
+        device=device,
     )
 
     manager = Manager(
@@ -143,29 +160,35 @@ def main() -> None:
     num_params = sum(p.numel() for p in m.parameters())
     print(f"Total number of parameters: {num_params}")
 
-    sort_by_keyword = "self_" + device + "_time_total"
+    # Setup profiling based on the flag
+    if args.enable_profiling:
+        sort_by_keyword = "self_" + device + "_time_total"
 
-    def trace_handler(p):
-        output = p.key_averages().table(
-            sort_by=sort_by_keyword,
-            row_limit=100,
+        def trace_handler(p):
+            output = p.key_averages().table(
+                sort_by=sort_by_keyword,
+                row_limit=100,
+            )
+            print(output)
+            p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
+
+        # You can use an epoch based training but with faults it's easier to use step
+        # based training.
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=5, warmup=1, active=10, repeat=2),
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=True,
         )
-        print(output)
-        p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
 
-    # You can use an epoch based training but with faults it's easier to use step
-    # based training.
-    prof = torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=5, warmup=1, active=10, repeat=2),
-        on_trace_ready=trace_handler,
-        record_shapes=True,
-        profile_memory=True,
-    )
+        prof.start()
+    else:
+        prof = None
 
-    prof.start()
     while True:
         for i, (inputs, labels) in enumerate(trainloader):
-            prof.step()
+            if prof is not None:
+                prof.step()
 
             inputs = inputs.to(device)
             labels = labels.to(device)
@@ -198,7 +221,8 @@ def main() -> None:
 
             if manager.current_step() >= 10000:
                 # complete training
-                prof.stop()
+                if prof is not None:
+                    prof.stop()
                 exit()
 
 

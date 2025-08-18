@@ -161,12 +161,21 @@ class _TimeoutManager:
             handle,
         )
 
-        stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.current_stream() if torch.cuda.is_available() else None
+        stream: Optional[torch.Stream] = (
+            torch.accelerator.current_stream() if torch.accelerator.is_available() else None
         )
 
         def callback(fut: Future[T]) -> None:
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            if stream is not None:
+                if torch.cuda.is_available():
+                    context = torch.cuda.stream(stream)
+                elif torch.xpu.is_available():
+                    context = torch.xpu.stream(stream)
+                else:
+                    context = nullcontext()
+            else:
+                context = nullcontext()
+            with context:
                 handle.cancel()
                 try:
                     timed_fut.set_result(fut.wait())
@@ -186,7 +195,7 @@ class _TimeoutManager:
 
         loop = self._maybe_start_event_loop()
 
-        event: torch.cuda.Event = torch.cuda.Event()
+        event: torch.Event = torch.Event()
         event.record()
 
         def handler() -> None:
