@@ -43,6 +43,7 @@ logging.basicConfig(level=logging.INFO)
 @record
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
+    RANK = int(os.environ.get("RANK", 0))
     RUN = int(os.environ.get("RUN", 0))
 
     output_folder = f"output/replica-{REPLICA_GROUP_ID}"
@@ -177,11 +178,11 @@ def main() -> None:
     print(f"Total number of parameters: {num_params}")
 
     def trace_handler(p):
-        dir = f"{output_folder}/profiles"
+        dir = f"{output_folder}/profiles/step-{p.step_num}"
         if not os.path.exists(dir):
             os.makedirs(dir, exist_ok=True)
 
-        p.export_chrome_trace(f"{dir}/step-{p.step_num}.json")
+        p.export_chrome_trace(f"{dir}/rank-{RANK}.json")
 
     # You can use an epoch based training but with faults it's easier to use step
     # based training.
@@ -190,6 +191,9 @@ def main() -> None:
         on_trace_ready=trace_handler,
         record_shapes=False,
         profile_memory=False,
+        experimental_config=torch.profiler._ExperimentalConfig(  # type: ignore
+            enable_cuda_sync_events=True
+        ),
     )
 
     prof.start()
