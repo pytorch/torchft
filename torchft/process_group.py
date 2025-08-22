@@ -69,6 +69,7 @@ from torch.utils._pytree import tree_any
 from torchft.device_mesh import *  # noqa: F401
 from torchft.futures import context_timeout, stream_timeout
 from torchft.multiprocessing import _MonitoredPipe
+from torchft.utils import get_stream_context
 from torchft.work import _DummyWork
 
 if TYPE_CHECKING:
@@ -407,6 +408,7 @@ class ProcessGroupWrapper(ProcessGroup):
             if hasattr(pg, "abort"):
                 pg.abort()
             else:
+                backend = None
                 try:
                     if torch.cuda.is_available():
                         backend = pg._get_backend(torch.device("cuda"))
@@ -624,7 +626,7 @@ class ProcessGroupGloo(ProcessGroupWrapper):
         )
 
 
-class _WorkCUDATimeout(Work):
+class _WorkAcceleratorTimeout(Work):
     def __init__(self, pg: ProcessGroup, work: Work, timeout: timedelta) -> None:
         super().__init__()
         self._pg = pg
@@ -743,7 +745,7 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         # pyre-fixme[16]: no attribute timeout
         if hasattr(opts, "timeout") and opts.timeout.total_seconds() > 0:
             timeout = opts.timeout
-        return _WorkCUDATimeout(self, work, timeout)
+        return _WorkAcceleratorTimeout(self, work, timeout)
 
     @contextmanager
     def _run_context(self) -> Generator[None, None, None]:
@@ -798,70 +800,6 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
     def getBackendName(self) -> str:
         return "torchft-nccl"
 
-class _WorkXPUTimeout(Work):
-    def __init__(self, pg: ProcessGroup, work: Work, timeout: timedelta) -> None:
-        super().__init__()
-        self._pg = pg
-        self._work = work
-        self._timeout = timeout
-
-    def wait(self, timeout: Optional[timedelta] = None) -> bool:
-        async_timeout = timeout or self._timeout
-        with self._stream_timeout(self._pg, async_timeout):
-            # In newer versions of PyTorch work may not exist if the call was
-            # not async. In these cases we can just schedule the stream timeout
-            # and return.
-            if self._work is not None:
-                if not self._work.wait():
-                    return False
-
-            # Always use xpu stream for timeout to avoid ProcessGroupXCCL
-            # watchdog firing and crashing the process.
-            if timeout is not None:
-                torch.xpu.synchronize()
-
-            return True
-
-    @classmethod
-    @contextmanager
-    def _stream_timeout(
-        cls, pg: ProcessGroup, timeout: timedelta
-    ) -> Generator[None, None, None]:
-        """
-        Set a timeout on the XPU stream for the given process group.
-
-        This does not hold a reference to self to avoid holding the work
-        object/tensors longer than necessary.
-
-        Args:
-            pg: The process group to call abort on.
-            timeout: The timeout to set on the XPU stream.
-        """
-
-        def callback() -> None:
-            logger.error(f"aborting after {timeout}!")
-            pg.abort()
-
-        # make sure .wait() can be cancelled if it blocks i.e. in barrier
-        with context_timeout(callback, timeout):
-            yield
-
-        # Cancel work if the xpu stream doesn't complete
-        stream_timeout(callback, timeout)
-
-    def get_future(self) -> torch.futures.Future[object]:
-        fut = self._work.get_future()
-
-        def done_callback(fut: torch.futures.Future[object]) -> None:
-            try:
-                with self._stream_timeout(self._pg, self._timeout):
-                    fut.wait()
-
-            except Exception as e:
-                logger.error(f"done callback failed: {e}")
-
-        fut.add_done_callback(done_callback)
-        return fut
 
 class ProcessGroupXCCL(ProcessGroupWrapper):
     """
@@ -918,7 +856,7 @@ class ProcessGroupXCCL(ProcessGroupWrapper):
         # pyre-fixme[16]: no attribute timeout
         if hasattr(opts, "timeout") and opts.timeout.total_seconds() > 0:
             timeout = opts.timeout
-        return _WorkXPUTimeout(self, work, timeout)
+        return _WorkAcceleratorTimeout(self, work, timeout)
 
     @contextmanager
     def _run_context(self) -> Generator[None, None, None]:
@@ -939,16 +877,14 @@ class ProcessGroupXCCL(ProcessGroupWrapper):
 
         self._errored = None
 
-        # pyre-fixme[16]: no attribute ProcessGroupXCCL
-        # TODO: siju-samuel
-        opts = None
+        # opts = None
         # opts = BaseProcessGroupXCCL.Options()
         # opts.config.blocking = False
 
         pg = BaseProcessGroup(store, rank, world_size)
         pg._set_default_backend(ProcessGroup.BackendType.XCCL)
         # pyre-fixme[16]: no attribute ProcessGroupXCCL
-        backend_class = BaseProcessGroupXCCL(store, rank, world_size) #, opts)
+        backend_class = BaseProcessGroupXCCL(store, rank, world_size)  # , opts)
         backend_class._set_sequence_number_for_group()
         backend_class.eager_connect_single_device(
             torch.device(torch.accelerator.current_device_index())
@@ -1357,6 +1293,7 @@ def _is_any_xpu(obj: object) -> bool:
     """
     return tree_any(lambda obj: isinstance(obj, torch.Tensor) and obj.is_xpu, obj)
 
+
 @dataclass
 class _OpMetadata:
     work: Work
@@ -1364,16 +1301,7 @@ class _OpMetadata:
 
     @contextmanager
     def set_stream(self) -> Generator[None, None, None]:
-        if self.stream is not None:
-            if torch.cuda.is_available():
-                context = torch.cuda.stream(self.stream)
-            elif torch.xpu.is_available():
-                context = torch.xpu.stream(self.stream)
-            else:
-                context = nullcontext()
-            with context:
-                yield
-        else:
+        with get_stream_context(self.stream):
             yield
 
 
@@ -1384,16 +1312,7 @@ class _FutureMetadata:
 
     @contextmanager
     def set_stream(self) -> Generator[None, None, None]:
-        if self.stream is not None:
-            if torch.cuda.is_available():
-                context = torch.cuda.stream(self.stream)
-            elif torch.xpu.is_available():
-                context = torch.xpu.stream(self.stream)
-            else:
-                context = nullcontext()
-            with context:
-                yield
-        else:
+        with get_stream_context(self.stream):
             yield
 
 
@@ -1485,7 +1404,11 @@ class ProcessGroupBaby(ProcessGroup):
         self._pipe = req_local = _MonitoredPipe(req_local)
         self._future_pipe = future_local = _MonitoredPipe(future_local)
 
-        curr_device = torch.accelerator.current_device_index() if torch.accelerator.is_available() else -1
+        curr_device = (
+            torch.accelerator.current_device_index()
+            if torch.accelerator.is_available()
+            else -1
+        )
 
         self._p = p = ctx.Process(
             target=self._worker,
@@ -1535,7 +1458,7 @@ class ProcessGroupBaby(ProcessGroup):
     ) -> None:
         try:
             if curr_device >= 0 and torch.accelerator.is_available():
-                torch.accelerator.set_device(curr_device)
+                torch.accelerator.set_device_index(curr_device)
 
             store = create_store_client(
                 store_addr,
@@ -1582,23 +1505,12 @@ class ProcessGroupBaby(ProcessGroup):
                     if stream_id is not None:
                         stream_key = f"{stream_device}/{stream_id}"
                         if stream_key not in streams:
-                            streams[stream_key] = torch.Stream(
-                                device=stream_device
-                            )
+                            streams[stream_key] = torch.Stream(device=stream_device)
                         stream = streams[stream_key]
                     else:
                         stream = None
 
-                    if stream is not None:
-                        if torch.cuda.is_available():
-                            context = torch.cuda.stream(stream)
-                        elif torch.xpu.is_available():
-                            context = torch.xpu.stream(stream)
-                        else:
-                            context = nullcontext()
-                    else:
-                        context = nullcontext()
-                    with context:
+                    with get_stream_context(stream):
                         # Make the stream wait on the cuda event to make sure we
                         # don't start the operation until the tensor is ready.
                         if event is not None:
@@ -1703,9 +1615,7 @@ class ProcessGroupBaby(ProcessGroup):
         except Exception as e:
             logger.exception(f"got unexpected error in future handler: {e}")
 
-    def _get_future(
-        self, op_id: int, stream: Optional[torch.Stream]
-    ) -> Future[object]:
+    def _get_future(self, op_id: int, stream: Optional[torch.Stream]) -> Future[object]:
         with self._futures_lock:
             fut = Future()
             self._futures[op_id] = _FutureMetadata(future=fut, stream=stream)
@@ -1744,8 +1654,12 @@ class ProcessGroupBaby(ProcessGroup):
 
         is_accelerator = _is_any_cuda(args) or _is_any_xpu(args)
 
-        stream_device = torch.accelerator.current_stream().device if is_accelerator else None
-        stream_id = torch.accelerator.current_stream().stream_id if is_accelerator else None
+        stream_device = (
+            torch.accelerator.current_stream().device if is_accelerator else None
+        )
+        stream_id = (
+            torch.accelerator.current_stream().stream_id if is_accelerator else None
+        )
         event = (
             torch.accelerator.current_stream().record_event(
                 torch.Event(interprocess=True)
