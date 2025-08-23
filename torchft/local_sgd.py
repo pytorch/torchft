@@ -565,8 +565,8 @@ class _StreamingDiLoCoFragment:
 
 class DiLoCo:
     """
-    DiLoCo is a subclass of LocalSGD that overrides the synchronization
-    mechanism to average and synchronize the pseudogradients (delta of the previous global weight and current local weights).
+    DiLoCo implements distributed optimization by averaging and synchronizing
+    pseudogradients (delta of the previous global weight and current local weights).
 
     The class implements a more general version of DiLoco, Streaming DiLoCo,
     which synchronizes fragments of pseudogradients at different steps.
