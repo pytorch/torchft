@@ -10,18 +10,14 @@ This module implements a fault tolerant version of LocalSGD and related methods.
 """
 import logging
 import math
-import threading
 from contextlib import nullcontext
 from types import TracebackType
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
-import torch.distributed as dist
 from torch import nn, optim
 from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
-from torch.nn.parameter import Parameter
-from torch.optim.optimizer import Optimizer
 from torch.utils.hooks import RemovableHandle
 
 from torchft.manager import Manager
