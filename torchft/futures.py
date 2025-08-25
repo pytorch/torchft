@@ -11,6 +11,8 @@ from unittest.mock import Mock
 import torch
 from torch.futures import Future
 
+from torchft.utils import get_stream_context
+
 T = TypeVar("T")
 
 
@@ -161,12 +163,14 @@ class _TimeoutManager:
             handle,
         )
 
-        stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.current_stream() if torch.cuda.is_available() else None
+        stream: Optional[torch.Stream] = (
+            torch.accelerator.current_stream()
+            if torch.accelerator.is_available()
+            else None
         )
 
         def callback(fut: Future[T]) -> None:
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            with get_stream_context(stream):
                 handle.cancel()
                 try:
                     timed_fut.set_result(fut.wait())
@@ -186,7 +190,7 @@ class _TimeoutManager:
 
         loop = self._maybe_start_event_loop()
 
-        event: torch.cuda.Event = torch.cuda.Event()
+        event: torch.Event = torch.Event()
         event.record()
 
         def handler() -> None:

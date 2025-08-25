@@ -69,6 +69,7 @@ from torch.utils._pytree import tree_any
 from torchft.device_mesh import *  # noqa: F401
 from torchft.futures import context_timeout, stream_timeout
 from torchft.multiprocessing import _MonitoredPipe
+from torchft.utils import get_stream_context
 from torchft.work import _DummyWork
 
 if TYPE_CHECKING:
@@ -289,10 +290,11 @@ class ProcessGroup(BaseProcessGroup):
         ) -> ProcessGroup:
             return self
 
+        devices = ["cpu"]
         if torch.cuda.is_available():
-            devices = ["cuda", "cpu"]
-        else:
-            devices = ["cpu"]
+            devices.append("cuda")
+        elif torch.xpu.is_available():
+            devices.append("xpu")
         dist.Backend.register_backend(group_name, create_pg, devices=devices)
 
         return group_name
@@ -406,8 +408,12 @@ class ProcessGroupWrapper(ProcessGroup):
             if hasattr(pg, "abort"):
                 pg.abort()
             else:
+                backend = None
                 try:
-                    backend = pg._get_backend(torch.device("cuda"))
+                    if torch.cuda.is_available():
+                        backend = pg._get_backend(torch.device("cuda"))
+                    elif torch.xpu.is_available():
+                        backend = pg._get_backend(torch.device("xpu"))
                 except RuntimeError:
                     backend = None
                 if backend is not None and hasattr(backend, "abort"):
@@ -620,7 +626,7 @@ class ProcessGroupGloo(ProcessGroupWrapper):
         )
 
 
-class _WorkCUDATimeout(Work):
+class _WorkAcceleratorTimeout(Work):
     def __init__(self, pg: ProcessGroup, work: Work, timeout: timedelta) -> None:
         super().__init__()
         self._pg = pg
@@ -739,7 +745,7 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         # pyre-fixme[16]: no attribute timeout
         if hasattr(opts, "timeout") and opts.timeout.total_seconds() > 0:
             timeout = opts.timeout
-        return _WorkCUDATimeout(self, work, timeout)
+        return _WorkAcceleratorTimeout(self, work, timeout)
 
     @contextmanager
     def _run_context(self) -> Generator[None, None, None]:
@@ -793,6 +799,117 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
 
     def getBackendName(self) -> str:
         return "torchft-nccl"
+
+
+class ProcessGroupXCCL(ProcessGroupWrapper):
+    """
+    This is a reconfigurable version of ProcessGroupXCCL for Intel XPU devices.
+
+    This process group is designed to work with Intel XPU devices using XCCL
+    (eXtended Collective Communication Library). It provides similar functionality
+    to ProcessGroupNCCL but optimized for Intel XPU architecture.
+
+    If you are using a supported version of XCCL, this will attempt to use
+    xccl abort mechanisms to recover from any timeouts.
+
+    This uses a Python user space event loop to asynchronously wait for the XCCL
+    operations to complete. This should not be used with very long timeouts as
+    the timeout entries are not cleaned up until the elapsed duration completes
+    which may result in slowness or excess memory usage.
+
+    Args:
+        timeout: the timeout to use for XCCL operations.
+    """
+
+    def __init__(self, timeout: timedelta = timedelta(seconds=60.0)) -> None:
+        super().__init__(timeout)
+        # Check if XPU is available and XCCL is supported
+        self._use_abort: bool = torch.xpu.is_available()
+
+        self._errored: Optional[Exception] = None
+
+        NONBLOCKING_TIMEOUT_ENV = "TORCH_XCCL_NONBLOCKING_TIMEOUT"
+        if NONBLOCKING_TIMEOUT_ENV not in os.environ:
+            warnings.warn(
+                f"{NONBLOCKING_TIMEOUT_ENV} is not set, defaulting to {timeout}. "
+                "If any nonblocking XCCL operations have already run this may "
+                "result in the default timeout of 30 minutes and hangs on error."
+            )
+            os.environ[NONBLOCKING_TIMEOUT_ENV] = str(timeout.total_seconds())
+
+    def _opts_hook(self, opts: T) -> T:
+        if not self._use_abort:
+            return opts
+
+        # We need to clear the timeout to apply our own timeout that doesn't
+        # crash the whole program.
+        if hasattr(opts, "timeout"):
+            # apply default timeout to disable
+            opts.timeout = AllgatherOptions().timeout
+        return opts
+
+    def _wrap_work(self, work: Work, opts: object) -> Work:
+        if not self._use_abort:
+            return work
+
+        timeout = self._timeout
+        # pyre-fixme[16]: no attribute timeout
+        if hasattr(opts, "timeout") and opts.timeout.total_seconds() > 0:
+            timeout = opts.timeout
+        return _WorkAcceleratorTimeout(self, work, timeout)
+
+    @contextmanager
+    def _run_context(self) -> Generator[None, None, None]:
+        timeout: timedelta = self._timeout
+
+        def callback() -> None:
+            logger.error(f"aborting after {timeout}!")
+            self.abort()
+
+        # when running in blocking mode we need to make sure collectives can
+        # timeout
+        with context_timeout(callback, timeout):
+            yield
+
+    def _create_pg(self, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
+        # pyre-fixme[21]: no attribute ProcessGroupXCCL
+        from torch.distributed import ProcessGroupXCCL as BaseProcessGroupXCCL
+
+        self._errored = None
+
+        # opts = None
+        # opts = BaseProcessGroupXCCL.Options()
+        # opts.config.blocking = False
+
+        pg = BaseProcessGroup(store, rank, world_size)
+        pg._set_default_backend(ProcessGroup.BackendType.XCCL)
+        # pyre-fixme[16]: no attribute ProcessGroupXCCL
+        backend_class = BaseProcessGroupXCCL(store, rank, world_size)  # , opts)
+        backend_class._set_sequence_number_for_group()
+        backend_class.eager_connect_single_device(
+            torch.device(torch.accelerator.current_device_index())
+        )
+        pg._register_backend(
+            torch.device("xpu"), ProcessGroup.BackendType.XCCL, backend_class
+        )
+        return pg
+
+    def abort(self) -> None:
+        # We need to set the error before aborting to ensure that errored()
+        # returns the error correctly when XCCL abort fires and unblocks the
+        # stream.
+        self._errored = RuntimeError("aborted")
+
+        super().abort()
+
+    def errored(self) -> Optional[Exception]:
+        # force a synchronization to ensure all work is complete
+        torch.xpu.current_stream().synchronize()
+
+        return self._errored
+
+    def getBackendName(self) -> str:
+        return "torchft-xccl"
 
 
 class ProcessGroupDummy(ProcessGroup):
@@ -1135,7 +1252,7 @@ class _BabyWork(Work):
         self,
         pg: "ProcessGroupBaby",
         op_id: int,
-        stream: Optional[torch.cuda.Stream],
+        stream: Optional[torch.Stream],
     ) -> None:
         super().__init__()
 
@@ -1168,31 +1285,34 @@ def _is_any_cuda(obj: object) -> bool:
     return tree_any(lambda obj: isinstance(obj, torch.Tensor) and obj.is_cuda, obj)
 
 
+def _is_any_xpu(obj: object) -> bool:
+    """
+    Returns true if any of the tensors in the object are XPU tensors.
+
+    Supports lists, tuples, dicts, and tensors.
+    """
+    return tree_any(lambda obj: isinstance(obj, torch.Tensor) and obj.is_xpu, obj)
+
+
 @dataclass
 class _OpMetadata:
     work: Work
-    stream: Optional[torch.cuda.Stream]
+    stream: Optional[torch.Stream]
 
     @contextmanager
     def set_stream(self) -> Generator[None, None, None]:
-        if self.stream is not None:
-            with torch.cuda.stream(self.stream):
-                yield
-        else:
+        with get_stream_context(self.stream):
             yield
 
 
 @dataclass
 class _FutureMetadata:
     future: Future[object]
-    stream: Optional[torch.cuda.Stream]
+    stream: Optional[torch.Stream]
 
     @contextmanager
     def set_stream(self) -> Generator[None, None, None]:
-        if self.stream is not None:
-            with torch.cuda.stream(self.stream):
-                yield
-        else:
+        with get_stream_context(self.stream):
             yield
 
 
@@ -1220,8 +1340,8 @@ class ProcessGroupBaby(ProcessGroup):
     """
     This is a process group that runs the underlying process group in a
     subprocess. Since it's running in a subprocess all tensors need to be in
-    shared memory or will be moved to shared memory. CUDA tensors are implicitly
-    share able and don't need any changes.
+    shared memory or will be moved to shared memory. CUDA/XPU tensors are implicitly
+    shareable and don't need any changes.
     """
 
     def __init__(self, timeout: Union[float, timedelta] = 60.0) -> None:
@@ -1284,7 +1404,11 @@ class ProcessGroupBaby(ProcessGroup):
         self._pipe = req_local = _MonitoredPipe(req_local)
         self._future_pipe = future_local = _MonitoredPipe(future_local)
 
-        curr_device = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        curr_device = (
+            torch.accelerator.current_device_index()
+            if torch.accelerator.is_available()
+            else -1
+        )
 
         self._p = p = ctx.Process(
             target=self._worker,
@@ -1333,8 +1457,8 @@ class ProcessGroupBaby(ProcessGroup):
         curr_device: int,
     ) -> None:
         try:
-            if curr_device >= 0 and torch.cuda.is_available():
-                torch.cuda.set_device(curr_device)
+            if curr_device >= 0 and torch.accelerator.is_available():
+                torch.accelerator.set_device_index(curr_device)
 
             store = create_store_client(
                 store_addr,
@@ -1350,7 +1474,7 @@ class ProcessGroupBaby(ProcessGroup):
                 return
             req_pipe.send(None)
 
-            streams: Dict[str, torch.cuda.Stream] = {}
+            streams: Dict[str, torch.Stream] = {}
             work: Dict[int, _OpMetadata] = {}
 
             while True:
@@ -1367,7 +1491,7 @@ class ProcessGroupBaby(ProcessGroup):
                                 dict[str, object],
                                 int,
                                 int,
-                                Optional[torch.cuda.Event],
+                                Optional[torch.Event],
                             ],
                             op[1:],
                         )
@@ -1381,18 +1505,12 @@ class ProcessGroupBaby(ProcessGroup):
                     if stream_id is not None:
                         stream_key = f"{stream_device}/{stream_id}"
                         if stream_key not in streams:
-                            streams[stream_key] = torch.cuda.Stream(
-                                device=stream_device
-                            )
+                            streams[stream_key] = torch.Stream(device=stream_device)
                         stream = streams[stream_key]
                     else:
                         stream = None
 
-                    with (
-                        torch.cuda.stream(stream)
-                        if stream is not None
-                        else nullcontext()
-                    ):
+                    with get_stream_context(stream):
                         # Make the stream wait on the cuda event to make sure we
                         # don't start the operation until the tensor is ready.
                         if event is not None:
@@ -1422,8 +1540,8 @@ class ProcessGroupBaby(ProcessGroup):
                         # Register event on the stream that we can pass to the main
                         # process.
                         event = (
-                            torch.cuda.current_stream().record_event(
-                                torch.cuda.Event(interprocess=True)
+                            torch.accelerator.current_stream().record_event(
+                                torch.Event(interprocess=True)
                             )
                             if metadata.stream is not None
                             else None
@@ -1444,8 +1562,8 @@ class ProcessGroupBaby(ProcessGroup):
                             with metadata.set_stream():
                                 fut.wait()
                                 event = (
-                                    torch.cuda.current_stream().record_event(
-                                        torch.cuda.Event(interprocess=True)
+                                    torch.accelerator.current_stream().record_event(
+                                        torch.Event(interprocess=True)
                                     )
                                     if metadata.stream is not None
                                     else None
@@ -1480,7 +1598,7 @@ class ProcessGroupBaby(ProcessGroup):
                     break
 
                 op_id, mode, data, event = cast(
-                    Tuple[int, str, object, Optional[torch.cuda.Event]], cmd
+                    Tuple[int, str, object, Optional[torch.Event]], cmd
                 )
                 with self._futures_lock:
                     meta = self._futures[op_id]
@@ -1497,9 +1615,7 @@ class ProcessGroupBaby(ProcessGroup):
         except Exception as e:
             logger.exception(f"got unexpected error in future handler: {e}")
 
-    def _get_future(
-        self, op_id: int, stream: Optional[torch.cuda.Stream]
-    ) -> Future[object]:
+    def _get_future(self, op_id: int, stream: Optional[torch.Stream]) -> Future[object]:
         with self._futures_lock:
             fut = Future()
             self._futures[op_id] = _FutureMetadata(future=fut, stream=stream)
@@ -1515,7 +1631,7 @@ class ProcessGroupBaby(ProcessGroup):
 
         assert self._pipe is not None
         op_id, event = cast(
-            Tuple[int, Optional[torch.cuda.Event]],
+            Tuple[int, Optional[torch.Event]],
             self._pipe.recv(timeout or self._timeout),
         )
         assert op_id == op_id
@@ -1536,15 +1652,19 @@ class ProcessGroupBaby(ProcessGroup):
         pipe = self._pipe
         assert pipe is not None
 
-        is_cuda = _is_any_cuda(args)
+        is_accelerator = _is_any_cuda(args) or _is_any_xpu(args)
 
-        stream_device = torch.cuda.current_stream().device if is_cuda else None
-        stream_id = torch.cuda.current_stream().stream_id if is_cuda else None
+        stream_device = (
+            torch.accelerator.current_stream().device if is_accelerator else None
+        )
+        stream_id = (
+            torch.accelerator.current_stream().stream_id if is_accelerator else None
+        )
         event = (
-            torch.cuda.current_stream().record_event(
-                torch.cuda.Event(interprocess=True)
+            torch.accelerator.current_stream().record_event(
+                torch.Event(interprocess=True)
             )
-            if is_cuda
+            if is_accelerator
             else None
         )
 
@@ -1567,7 +1687,7 @@ class ProcessGroupBaby(ProcessGroup):
         return _BabyWork(
             pg=self,
             op_id=op_id,
-            stream=torch.cuda.current_stream() if is_cuda else None,
+            stream=torch.accelerator.current_stream() if is_accelerator else None,
         )
 
     def allgather(
@@ -1848,3 +1968,43 @@ class ProcessGroupBabyNCCL(ProcessGroupBaby):
 
     def getBackendName(self) -> str:
         return "torchft-baby-nccl"
+
+
+class ProcessGroupBabyXCCL(ProcessGroupBaby):
+    """
+    This is a ProcessGroup that runs XCCL in a subprocess for Intel XPU devices.
+
+    For the XCCL backend, extra memory will be used by the subprocesses XPU
+    context compared to running XCCL in the main process. This is typically
+    dependent on the XPU memory architecture.
+
+    The returned Work objects only synchronize on the XPU stream and not on the
+    CPU side. This works by passing XPU Events between the processes. To do a
+    CPU synchronize, call torch.xpu.synchronize() after wait().
+
+    WARNING: If the child process is killed while an operation is running, XPU
+    tensors may leak in the current PyTorch implementation. TODO fix
+
+    WARNING: As this uses a separate XPU context for the subprocess, performance
+    may be slower than using XCCL directly. Separate XPU contexts can not run
+    at the same time so network and compute kernels will not overlap execution
+    and instead do time sharing which may reduce XPU utilization.
+    """
+
+    @classmethod
+    def _create_pg(cls, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
+        # Check if XPU and XCCL are available
+        from torch.distributed import ProcessGroupXCCL as BaseProcessGroupXCCL
+
+        pg = BaseProcessGroup(store, rank, world_size)
+        pg._set_default_backend(ProcessGroup.BackendType.XCCL)
+        # pyre-fixme[16]: no attribute ProcessGroupNCCL
+        backend_class = BaseProcessGroupXCCL(store, rank, world_size)
+        backend_class._set_sequence_number_for_group()
+        pg._register_backend(
+            torch.device("xpu"), ProcessGroup.BackendType.XCCL, backend_class
+        )
+        return pg
+
+    def getBackendName(self) -> str:
+        return "torchft-baby-xccl"

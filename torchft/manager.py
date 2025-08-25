@@ -58,6 +58,7 @@ from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.checkpointing._rwlock import RWLock
 from torchft.futures import future_timeout
+from torchft.utils import get_stream_context
 from torchft.work import _DummyWork
 
 if TYPE_CHECKING:
@@ -276,12 +277,12 @@ class Manager:
         self._pg = pg
         self._manager: Optional[ManagerServer] = None
 
-        self._recovery_stream: Optional["torch.cuda.Stream"] = (
-            torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._recovery_stream: Optional["torch.Stream"] = (
+            torch.Stream() if torch.accelerator.is_available() else None
         )
 
         # Used to synchronize recovery operation
-        self._recovery_event: Optional[torch.cuda.Event] = None
+        self._recovery_event: Optional[torch.Event] = None
 
         if self._group_rank == 0:
             if port is None:
@@ -413,8 +414,9 @@ class Manager:
             # Run the allreduce async and save the work object so we can wait on
             # it later.
             if should_quantize and IS_TRITON_AVAILABLE:
+                # pyre-fixme[6]: Expected `Optional[streams.Stream]` but got `_C.Stream`
                 work = allreduce_quantized(
-                    [tensor], ReduceOp.SUM, self._pg, torch.cuda.current_stream()
+                    [tensor], ReduceOp.SUM, self._pg, torch.accelerator.current_stream()
                 )
             else:
                 work = self._pg.allreduce([tensor], ReduceOp.SUM)
@@ -482,8 +484,10 @@ class Manager:
 
         fut = future_timeout(fut, timeout or self._timeout)
 
-        stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.current_stream() if torch.cuda.is_available() else None
+        stream: Optional[torch.Stream] = (
+            torch.accelerator.current_stream()
+            if torch.accelerator.is_available()
+            else None
         )
 
         # schedule error handling as a continuation on the Future
@@ -492,7 +496,7 @@ class Manager:
         ) -> T:
             nonlocal default, stream
 
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            with get_stream_context(stream):
                 try:
                     return fut.value()
                 except Exception as e:
@@ -546,7 +550,9 @@ class Manager:
             shrink_only=shrink_only,
             quorum_timeout=timeout or self._quorum_timeout,
             curr_device=(
-                torch.cuda.current_device() if torch.cuda.is_available() else -1
+                torch.accelerator.current_device_index()
+                if torch.accelerator.is_available()
+                else -1
             ),
         )
         if not self._use_async_quorum:
@@ -582,8 +588,8 @@ class Manager:
     ) -> None:
         torch.multiprocessing._set_thread_name("torchft_quorum")
 
-        if curr_device >= 0 and torch.cuda.is_available():
-            torch.cuda.set_device(curr_device)
+        if curr_device >= 0 and torch.accelerator.is_available():
+            torch.accelerator.set_device_index(curr_device)
 
         quorum = None
         with torch.profiler.record_function("torchft::manager::_client::_quorum"):
@@ -649,11 +655,7 @@ class Manager:
         if allow_heal:
             # run recovery on the recovery stream if available
             recovery_stream = self._recovery_stream
-            with (
-                torch.cuda.stream(recovery_stream)
-                if recovery_stream is not None
-                else nullcontext()
-            ):
+            with get_stream_context(recovery_stream):
                 try:
                     if quorum.recover_dst_replica_ranks:
                         self._logger.info(
@@ -714,7 +716,7 @@ class Manager:
                     self.report_error(e)
 
                 self._recovery_event = (
-                    torch.cuda.current_stream().record_event()
+                    torch.accelerator.current_stream().record_event()
                     if recovery_stream is not None
                     else None
                 )
@@ -784,8 +786,8 @@ class Manager:
         with torch.profiler.record_function(
             "torchft::manager::should_commit::current_stream::synchronize"
         ):
-            if torch.cuda.is_available():
-                torch.cuda.current_stream().synchronize()
+            if torch.accelerator.is_available():
+                torch.accelerator.current_stream().synchronize()
 
         if err := self._pg.errored():
             self.report_error(err)
@@ -1128,8 +1130,10 @@ class _ManagedWork(dist._Work):
 
         # The stream used to created the `Work` - we ensure all operations in the future
         # callback chain are executed on this stream
-        self._stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.current_stream() if torch.cuda.is_available() else None
+        self._stream: Optional[torch.Stream] = (
+            torch.accelerator.current_stream()
+            if torch.accelerator.is_available()
+            else None
         )
 
         # To ensure the future callback chain is only created once
@@ -1164,11 +1168,7 @@ class _ManagedWork(dist._Work):
                 nonlocal managed_fut, value
                 # change the stream to avoid making the callback stream
                 # dependent on process group stream running the allreduce
-                with (
-                    torch.cuda.stream(self._stream)
-                    if self._stream is not None
-                    else nullcontext()
-                ):
+                with get_stream_context(self._stream):
                     # Setup stream dependency
                     fut.wait()
                     assert managed_fut._callback
@@ -1199,24 +1199,16 @@ class _ManagedWork(dist._Work):
         This makes sure users of the API are aware about stream dependencies.
         """
         if self._stream is not None:
-            assert self._stream == torch.cuda.current_stream()
+            assert self._stream == torch.accelerator.current_stream()
 
     def wait(self, timeout: Optional[timedelta] = None) -> bool:
         self._assert_same_stream()
 
-        with (
-            torch.cuda.stream(self._stream)
-            if self._stream is not None
-            else nullcontext()
-        ):
+        with get_stream_context(self._stream):
             self._work.wait()
             self._set_future_callback()
 
-        with (
-            torch.cuda.stream(self._stream)
-            if self._stream is not None
-            else nullcontext()
-        ):
+        with get_stream_context(self._stream):
             self._managed_fut_tail.wait()
 
         return True
@@ -1224,11 +1216,7 @@ class _ManagedWork(dist._Work):
     def block_current_stream(self, timeout: Optional[timedelta] = None) -> None:
         self._assert_same_stream()
 
-        with (
-            torch.cuda.stream(self._stream)
-            if self._stream is not None
-            else nullcontext()
-        ):
+        with get_stream_context(self._stream):
             self._work.block_current_stream()
 
         self._set_future_callback()
@@ -1238,6 +1226,8 @@ class _ManagedWork(dist._Work):
 
         if torch.cuda.is_available():
             self.block_current_stream()
+        elif torch.xpu.is_available():
+            self._set_future_callback()
         else:
             # No stream dependencies need to be set
             self._set_future_callback()
