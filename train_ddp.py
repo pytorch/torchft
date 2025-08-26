@@ -12,6 +12,9 @@ from datetime import timedelta
 REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
 os.environ["CUDA_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
 os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
+# Set XPU device visibility for Intel XPU devices
+if "XPU_VISIBLE_DEVICES" not in os.environ:
+    os.environ["XPU_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +31,7 @@ from torchft import (
     Optimizer,
     ProcessGroupGloo,
     ProcessGroupNCCL,
+    ProcessGroupXCCL,
 )
 from torchft.checkpointing.pg_transport import PGTransport
 
@@ -75,19 +79,24 @@ def main() -> None:
             "optim": optimizer.state_dict(),
         }
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    pg = (
-        ProcessGroupNCCL(
-            timeout=timedelta(seconds=30),
-        )
-        if torch.cuda.is_available()
-        else ProcessGroupGloo(timeout=timedelta(seconds=5))
-    )
+    if torch.cuda.is_available():
+        device = "cuda"
+        pg = ProcessGroupNCCL(timeout=timedelta(seconds=30))
+    elif torch.xpu.is_available():
+        device = "xpu"
+        pg = ProcessGroupXCCL(timeout=timedelta(seconds=30))
+    else:
+        device = "cpu"
+        pg = ProcessGroupGloo(timeout=timedelta(seconds=5))
 
     transport = PGTransport(
         pg,
         timeout=timedelta(seconds=10),
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
+        device=(
+            "cuda"
+            if torch.cuda.is_available()
+            else "xpu" if torch.xpu.is_available() else "cpu"
+        ),
     )
 
     manager = Manager(
