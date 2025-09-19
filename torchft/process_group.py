@@ -1062,30 +1062,6 @@ class FakeProcessGroupWrapper(ProcessGroupWrapper):
         return work
 
 
-class _ManagedWork(Work):
-    def __init__(self, manager: "Manager", work: Work, default_result: object) -> None:
-        super().__init__()
-
-        self._manager = manager
-        self._work = work
-        self._default_result = default_result
-
-    def wait(self, timeout: Optional[timedelta] = None) -> bool:
-        try:
-            if self._work is not None:
-                if timeout is not None:
-                    self._work.wait(timeout)
-                else:
-                    self._work.wait()
-        except Exception as e:
-            self._manager.report_error(e)
-
-        return True
-
-    def get_future(self) -> Future[object]:
-        return self._manager.wrap_future(self._work.get_future(), self._default_result)
-
-
 class ManagedProcessGroup(ProcessGroupWrapper):
     """
     This is a wrapper around any ProcessGroup that is managed by a torchft
@@ -1105,23 +1081,13 @@ class ManagedProcessGroup(ProcessGroupWrapper):
         self._manager = manager
 
     def allreduce(self, tensors: List[torch.Tensor], opts: object) -> Work:
-        # Ensure we have a valid quorum and are configured before trying to do
-        # any work.
-        self._manager.wait_quorum()
+        if isinstance(opts, ReduceOp):
+            return self._manager.allreduce(tensors, reduce_op=opts)
 
-        if self._manager.errored() is not None:
-            return _DummyWork(tensors)
-        try:
-            work = super().allreduce(tensors, opts)
-        except Exception as e:
-            self._manager.report_error(e)
-            return _DummyWork(tensors)
+        if isinstance(opts, AllreduceOptions):
+            return self._manager.allreduce(tensors, reduce_op=opts.reduceOp)
 
-        return _ManagedWork(
-            self._manager,
-            work,
-            tensors,
-        )
+        assert False, "unreachable"
 
     def size(self) -> int:
         return self._manager.num_participants()
