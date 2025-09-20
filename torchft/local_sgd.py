@@ -762,6 +762,7 @@ class DiLoCo:
             # can be overrepresented.
             self._manager.start_quorum()
             fragment = self._current_fragment()
+            logger.info(f"Preparing fragment={fragment} step={self._local_step}")
             self._fragments[fragment].prepare_sync()
 
         if self._local_step < self._sync_every:
@@ -770,6 +771,7 @@ class DiLoCo:
         if self._local_step == self._sync_every:
             # Time to sync a fragment
             fragment = self._current_fragment()
+            logger.info(f"Syncing fragment={fragment} step={self._local_step} manager_step={self._manager.current_step()}")
             self._fragments[fragment].perform_sync()
 
             # If the allreduce truly failed, we'll keep retrying this fragment.
