@@ -35,6 +35,7 @@ You can also override the resource configuration manually:
 - TrainingActor: Individual trainer processes
 - ReplicaActor: Manages groups of trainers
 - OrchestrationManager: Top-level orchestration and failure recovery
+- FailureController: Optional, periodically injects random failures into trainer processes
 
 ##### FAILURE RECOVERY
 - Automatic retry with configurable delays (PER_ATTEMPT_DELAY)
