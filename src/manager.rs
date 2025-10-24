@@ -620,6 +620,7 @@ fn compute_quorum_results(
             .map(|p| p.commit_failures)
             .max()
             .unwrap_or(0),
+        replica_ids: participants.iter().map(|p| p.replica_id.clone()).collect(),
     })
 }
 

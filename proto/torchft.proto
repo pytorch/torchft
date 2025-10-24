@@ -96,6 +96,7 @@ message ManagerQuorumResponse {
   int64 replica_world_size = 10;
   bool heal = 11;
   int64 commit_failures = 12;
+  repeated string replica_ids = 13;
 }
 
 message CheckpointMetadataRequest {
