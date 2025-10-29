@@ -1,0 +1,10 @@
+[cli:run]
+component=../torchft/torchx.py:hsdp
+scheduler=local_cwd
+
+[local_cwd]
+auto_set_cuda_visible_devices=True
+
+[component:../torchft/torchx.py:hsdp]
+script=train.py
+gpu=1
